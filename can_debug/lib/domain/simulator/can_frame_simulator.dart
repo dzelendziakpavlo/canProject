@@ -2,32 +2,44 @@ import 'dart:async';
 import 'dart:math';
 
 import '../models/can_frame.dart';
+import '../models/can_stats.dart';
 import '../detection/can_error_checker.dart';
+import '../source/can_frame_source.dart';
 
 /// CAN Frame Simulator that generates random CAN frames
-class CanFrameSimulator {
-  late StreamController<CanFrame> _controller;
-  late Timer _timer;
+class CanFrameSimulator implements CanFrameSource {
+  late StreamController<CanFrame> _frameController;
+  final StreamController<SourceState> _stateController =
+      StreamController<SourceState>.broadcast();
+  Timer? _timer;
   final Random _random = Random();
   final CanErrorChecker _errorChecker = CanErrorChecker();
-  
+
   /// Configuration constants
   static const int minDelay = 100; // milliseconds
   static const int maxDelay = 200; // milliseconds
   static const double corruptionRate = 0.1; // 10% of frames are corrupted
   static const int maxCanId = 0x7FF; // 11-bit CAN ID
   static const int maxExtendedCanId = 0x1FFFFFFF; // 29-bit extended CAN ID
-  
+
   bool _isRunning = false;
   int _frameCounter = 0;
 
-  /// Constructor initializes the stream controller
   CanFrameSimulator() {
-    _controller = StreamController<CanFrame>.broadcast();
+    _frameController = StreamController<CanFrame>.broadcast();
   }
 
-  /// Get the stream of CAN frames
-  Stream<CanFrame> get frameStream => _controller.stream;
+  @override
+  String get name => 'Simulator';
+
+  @override
+  Stream<CanFrame> get frameStream => _frameController.stream;
+
+  @override
+  Stream<SourceState> get stateStream => _stateController.stream;
+
+  @override
+  Stream<CanStats>? get statsStream => null;
 
   /// Check if simulator is currently running
   bool get isRunning => _isRunning;
@@ -35,33 +47,34 @@ class CanFrameSimulator {
   /// Get total frames generated
   int get frameCount => _frameCounter;
 
-  /// Start generating CAN frames
-  void start() {
+  @override
+  Future<void> start() async {
     if (_isRunning) return;
-    
     _isRunning = true;
     _frameCounter = 0;
+    _stateController.add(SourceState.streaming);
     _scheduleNextFrame();
   }
 
-  /// Stop generating CAN frames
-  void stop() {
+  @override
+  Future<void> stop() async {
     if (!_isRunning) return;
-    
     _isRunning = false;
-    _timer.cancel();
+    _timer?.cancel();
+    _timer = null;
+    _stateController.add(SourceState.idle);
   }
 
   /// Reset the simulator
-  void reset() {
-    stop();
+  Future<void> reset() async {
+    await stop();
     _frameCounter = 0;
   }
 
   /// Schedule the next frame generation
   void _scheduleNextFrame() {
     if (!_isRunning) return;
-    
+
     final delay = minDelay + _random.nextInt(maxDelay - minDelay + 1);
     _timer = Timer(Duration(milliseconds: delay), () {
       _generateFrame();
@@ -73,27 +86,20 @@ class CanFrameSimulator {
   void _generateFrame() {
     final frame = _createRandomFrame();
     _frameCounter++;
-    _controller.add(frame);
+    _frameController.add(frame);
   }
 
   /// Create a random CAN frame
   CanFrame _createRandomFrame() {
-    // Generate random CAN ID (mix of standard and extended IDs)
     final useExtendedId = _random.nextBool();
-    final id = useExtendedId 
+    final id = useExtendedId
         ? _random.nextInt(maxExtendedCanId)
         : _random.nextInt(maxCanId);
 
-    // Generate random DLC (0-8)
     final dlc = _random.nextInt(9);
-
-    // Generate random data based on DLC
     final data = List.generate(dlc, (index) => _random.nextInt(256));
-
-    // Determine if frame should be corrupted (10% chance)
     final isCorrupted = _random.nextDouble() < corruptionRate;
 
-    // Create initial frame
     final initialFrame = CanFrame.create(
       id: id,
       dlc: dlc,
@@ -102,17 +108,14 @@ class CanFrameSimulator {
       isCorrupted: isCorrupted,
     );
 
-    // Analyze frame for additional errors (using the same frame instance)
     final errorInfos = _errorChecker.analyzeFrame(initialFrame);
-    
-    // Create final frame with all error information
     final hasAdditionalErrors = errorInfos.isNotEmpty;
-    
+
     return CanFrame.create(
       id: id,
       dlc: dlc,
       data: data,
-      timestamp: initialFrame.timestamp, // Use same timestamp
+      timestamp: initialFrame.timestamp,
       isCorrupted: isCorrupted || hasAdditionalErrors,
       errors: errorInfos,
     );
@@ -136,13 +139,13 @@ class CanFrameSimulator {
     );
 
     _frameCounter++;
-    _controller.add(customFrame);
+    _frameController.add(customFrame);
   }
 
   /// Generate a burst of frames (for testing high traffic scenarios)
   void generateBurst(int count) {
     if (!_isRunning) return;
-    
+
     for (int i = 0; i < count; i++) {
       Timer(Duration(milliseconds: i * 10), () {
         _generateFrame();
@@ -150,10 +153,12 @@ class CanFrameSimulator {
     }
   }
 
-  /// Dispose of resources
+  @override
   void dispose() {
-    stop();
-    _controller.close();
+    _timer?.cancel();
+    _frameController.close();
+    _stateController.close();
+    _isRunning = false;
   }
 
   /// Get simulator statistics

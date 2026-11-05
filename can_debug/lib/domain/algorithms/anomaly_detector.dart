@@ -197,19 +197,14 @@ class CanAnomalyDetector {
   /// Додає фрейм та перевіряє на аномалію
   AnomalyResult analyzeFrame(CanFrame frame) {
     _recentFrames.add(frame);
-    
-    // Підтримуємо sliding window
     if (_recentFrames.length > _trainingSize * 2) {
       _recentFrames.removeAt(0);
     }
-    
-    // Навчаємо модель якщо достатньо даних
     if (!_isTrained && _recentFrames.length >= _trainingSize) {
       final normalFrames = _recentFrames.take(_trainingSize).toList();
       _forest.train(normalFrames);
       _isTrained = true;
     }
-    
     if (!_isTrained) {
       return AnomalyResult(
         score: 0.0,

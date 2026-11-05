@@ -4,7 +4,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/can_session.dart';
 import '../models/can_frame.dart';
+import '../models/can_stats.dart';
+import '../models/can_session_event.dart';
+import '../models/can_session_summary.dart';
 import '../detection/can_error_checker.dart';
+import 'session_summary_builder.dart';
 
 /// Сервіс для управління CAN сесіями
 class CanSessionService {
@@ -30,23 +34,30 @@ class CanSessionService {
   /// Поточна активна сесія
   CanSession? get currentSession => _currentSession;
 
+  final SessionSummaryBuilder _summaryBuilder = SessionSummaryBuilder();
+
   /// Ініціалізація сервісу
   Future<void> initialize() async {
     await _loadSessions();
   }
 
   /// Створити нову сесію
-  Future<CanSession> createSession() async {
+  Future<CanSession> createSession({String? sourceName}) async {
     final sessionNumber = await _getNextSessionNumber();
     final sessionName = 'Schema $sessionNumber';
     
-    _currentSession = CanSession.create(sessionName);
+    _currentSession = CanSession.create(sessionName).updateWith(
+      sourceName: sourceName,
+    );
     return _currentSession!;
   }
 
   /// Оновити поточну сесію
   void updateCurrentSession({
+    String? sourceName,
     required List<CanFrame> frames,
+    List<CanStats>? statsSnapshots,
+    List<CanSessionEvent>? events,
     required Map<CanErrorType, int> errorStats,
     required int totalFrames,
     required int errorFrames,
@@ -55,12 +66,50 @@ class CanSessionService {
     if (_currentSession == null) return;
 
     _currentSession = _currentSession!.updateWith(
+      sourceName: sourceName,
       frames: List.from(frames),
+      statsSnapshots: statsSnapshots != null ? List.from(statsSnapshots) : null,
+      events: events != null ? List.from(events) : null,
       errorStats: Map.from(errorStats),
       totalFrames: totalFrames,
       errorFrames: errorFrames,
       errorRate: errorRate,
     );
+  }
+
+  /// Додати подію до поточної сесії
+  void recordSessionEvent(CanSessionEvent event) {
+    if (_currentSession == null) return;
+
+    final updatedEvents = List<CanSessionEvent>.from(_currentSession!.events)..add(event);
+    _currentSession = _currentSession!.updateWith(events: updatedEvents);
+  }
+
+  /// Додати знімок стану TWAI до поточної сесії
+  void recordStatsSnapshot(CanStats stats) {
+    if (_currentSession == null) return;
+
+    final updatedSnapshots = List<CanStats>.from(_currentSession!.statsSnapshots)..add(stats);
+    _currentSession = _currentSession!.updateWith(statsSnapshots: updatedSnapshots);
+  }
+
+  /// Побудувати derived summary для будь-якої сесії.
+  CanSessionSummary buildSessionSummary(CanSession session) {
+    return _summaryBuilder.build(session);
+  }
+
+  /// Derived summary поточної активної сесії, якщо вона існує.
+  CanSessionSummary? get currentSessionSummary {
+    final session = _currentSession;
+    if (session == null) return null;
+    return buildSessionSummary(session);
+  }
+
+  /// Derived summary для збереженої сесії.
+  CanSessionSummary? getSessionSummaryById(String sessionId) {
+    final session = getSessionById(sessionId);
+    if (session == null) return null;
+    return buildSessionSummary(session);
   }
 
   /// Завершити поточну сесію та зберегти
@@ -85,6 +134,23 @@ class CanSessionService {
   /// Очистити всі сесії
   Future<void> clearAllSessions() async {
     _savedSessions.clear();
+    await _saveSessions();
+    _sessionsController.add(_savedSessions);
+  }
+
+  /// Додати імпортовану сесію в збереження
+  Future<void> addImportedSession(CanSession session) async {
+    // If a session with same id exists, create a new id and mark as imported
+    final exists = _savedSessions.any((s) => s.id == session.id);
+    CanSession toSave = session;
+    if (exists) {
+      final Map<String, dynamic> map = session.toJson();
+      map['id'] = DateTime.now().millisecondsSinceEpoch.toString();
+      map['name'] = '${session.name} (imported)';
+      toSave = CanSession.fromJson(map);
+    }
+
+    _savedSessions.insert(0, toSave);
     await _saveSessions();
     _sessionsController.add(_savedSessions);
   }
@@ -142,6 +208,24 @@ class CanSessionService {
           sessionsList.map((json) => CanSession.fromJson(json)).toList(),
         );
         _sessionsController.add(_savedSessions);
+
+        final needsMigration = _savedSessions.any(
+          (session) => session.schemaVersion < CanSession.currentSchemaVersion,
+        );
+        if (needsMigration) {
+          _savedSessions.replaceRange(
+            0,
+            _savedSessions.length,
+            _savedSessions
+                .map(
+                  (session) => session.updateWith(
+                    schemaVersion: CanSession.currentSchemaVersion,
+                  ),
+                )
+                .toList(),
+          );
+          await _saveSessions();
+        }
       }
     } catch (e) {
       print('Error loading sessions: $e');
@@ -171,6 +255,12 @@ class CanSessionService {
   /// Очистити ресурси
   void dispose() {
     _sessionsController.close();
+  }
+
+  /// Відкинути поточну сесію без збереження
+  /// Використовується коли користувач відмовляється зберігати сесію
+  void discardCurrentSession() {
+    _currentSession = null;
   }
 }
 

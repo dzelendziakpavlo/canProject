@@ -125,16 +125,30 @@ class CanFrameStopped extends CanFrameState {
   final Map<CanErrorType, int> errorStats;
   final int totalFrames;
   final int errorFrames;
+  final List<double> errorRateHistory;
+  final double currentErrorRate;
+  final double framesPerSecond;
 
   const CanFrameStopped({
     required this.frames,
     required this.errorStats,
     required this.totalFrames,
     required this.errorFrames,
+    required this.errorRateHistory,
+    required this.currentErrorRate,
+    required this.framesPerSecond,
   });
 
   @override
-  List<Object> get props => [frames, errorStats, totalFrames, errorFrames];
+  List<Object> get props => [
+    frames,
+    errorStats,
+    totalFrames,
+    errorFrames,
+    errorRateHistory,
+    currentErrorRate,
+    framesPerSecond,
+  ];
 }
 
 /// Стан помилки

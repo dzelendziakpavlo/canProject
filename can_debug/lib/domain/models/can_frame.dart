@@ -1,3 +1,5 @@
+import '../detection/can_error_checker.dart';
+
 /// CAN Frame model representing a CAN bus message
 class CanFrame {
   /// CAN Frame identifier (11-bit or 29-bit)
@@ -17,7 +19,13 @@ class CanFrame {
   
   /// Flag indicating if the frame contains intentional errors
   final bool isCorrupted;
-  
+
+  /// Remote Transmission Request — frame has no data payload, requests data from another node
+  final bool isRtr;
+
+  /// Extended frame format — 29-bit identifier (vs standard 11-bit)
+  final bool isExtended;
+
   /// Additional error information (will be populated by error checker)
   final List<dynamic> errors;
 
@@ -28,6 +36,8 @@ class CanFrame {
     required this.crc,
     required this.timestamp,
     this.isCorrupted = false,
+    this.isRtr = false,
+    this.isExtended = false,
     this.errors = const [],
   }) : assert(dlc >= 0 && dlc <= 8, 'DLC must be between 0 and 8'),
        assert(data.length <= 8, 'Data length cannot exceed 8 bytes'),
@@ -40,18 +50,22 @@ class CanFrame {
     required List<int> data,
     DateTime? timestamp,
     bool isCorrupted = false,
+    bool isRtr = false,
+    bool isExtended = false,
     List<dynamic> errors = const [],
   }) {
     final frameTimestamp = timestamp ?? DateTime.now();
     final crc = _calculateCrc(id, dlc, data);
-    
+
     return CanFrame(
       id: id,
       dlc: dlc,
       data: List.from(data),
-      crc: isCorrupted ? (crc + 1) % 256 : crc, // Corrupt CRC if needed
+      crc: isCorrupted ? (crc + 1) % 256 : crc,
       timestamp: frameTimestamp,
       isCorrupted: isCorrupted,
+      isRtr: isRtr,
+      isExtended: isExtended,
       errors: errors,
     );
   }
@@ -66,7 +80,12 @@ class CanFrame {
   }
 
   /// Get frame status as string
-  String get status => isCorrupted ? 'ERROR' : 'OK';
+  String get status => isCorrupted ? 'ERROR' : isRtr ? 'RTR' : isExtended ? 'EXT' : 'OK';
+
+  /// ID formatted as hex — 8 digits for 29-bit extended, 3 for standard 11-bit
+  String get idHex => isExtended
+      ? '0x${id.toRadixString(16).toUpperCase().padLeft(8, '0')}'
+      : '0x${id.toRadixString(16).toUpperCase().padLeft(3, '0')}';
 
   /// Get data as hex string
   String get dataHex {
@@ -122,7 +141,12 @@ class CanFrame {
       'crc': crc,
       'timestamp': timestamp.toIso8601String(),
       'isCorrupted': isCorrupted,
-      'errors': errors,
+      'isRtr': isRtr,
+      'isExtended': isExtended,
+        'errors': errors
+          .whereType<CanErrorInfo>()
+          .map((error) => error.toJson())
+          .toList(),
     };
   }
 
@@ -135,7 +159,13 @@ class CanFrame {
       crc: json['crc'],
       timestamp: DateTime.parse(json['timestamp']),
       isCorrupted: json['isCorrupted'] ?? false,
-      errors: json['errors'] ?? [],
+      isRtr: json['isRtr'] ?? false,
+      isExtended: json['isExtended'] ?? false,
+        errors: (json['errors'] as List?)
+            ?.whereType<Map>()
+            .map((error) => CanErrorInfo.fromJson(Map<String, dynamic>.from(error)))
+            .toList() ??
+          const [],
     );
   }
 }

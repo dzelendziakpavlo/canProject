@@ -34,8 +34,7 @@ class AnimatedButton extends StatefulWidget {
 class _AnimatedButtonState extends State<AnimatedButton>
     with SingleTickerProviderStateMixin {
   late AnimationController _controller;
-  bool _isPressed = false;
-  bool _isHovered = false;
+  // Removed unused _isPressed/_isHovered; animation controller drives visuals.
 
   @override
   void initState() {
@@ -53,18 +52,15 @@ class _AnimatedButtonState extends State<AnimatedButton>
   }
 
   void _onTapDown(TapDownDetails details) {
-    setState(() => _isPressed = true);
     _controller.forward();
   }
 
   void _onTapUp(TapUpDetails details) {
-    setState(() => _isPressed = false);
     _controller.reverse();
     widget.onPressed?.call();
   }
 
   void _onTapCancel() {
-    setState(() => _isPressed = false);
     _controller.reverse();
   }
 
@@ -75,8 +71,7 @@ class _AnimatedButtonState extends State<AnimatedButton>
     final foregroundColor = widget.foregroundColor ?? AppTheme.textPrimary;
 
     return MouseRegion(
-      onEnter: (_) => setState(() => _isHovered = true),
-      onExit: (_) => setState(() => _isHovered = false),
+      // Hover callbacks removed (unused state). Add visual changes here if needed.
       child: GestureDetector(
         onTapDown: _onTapDown,
         onTapUp: _onTapUp,
@@ -104,26 +99,30 @@ class _AnimatedButtonState extends State<AnimatedButton>
                     ),
                   ],
                 ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    if (widget.icon != null) ...[
-                      Icon(
-                        widget.icon,
-                        color: foregroundColor,
-                        size: 20,
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      if (widget.icon != null) ...[
+                        Icon(
+                          widget.icon,
+                          color: foregroundColor,
+                          size: 20,
+                        ),
+                        const SizedBox(width: 8),
+                      ],
+                      DefaultTextStyle(
+                        style: TextStyle(
+                          color: foregroundColor,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        child: widget.child,
                       ),
-                      const SizedBox(width: 8),
                     ],
-                    DefaultTextStyle(
-                      style: TextStyle(
-                        color: foregroundColor,
-                        fontWeight: FontWeight.w600,
-                      ),
-                      child: widget.child,
-                    ),
-                  ],
+                  ),
                 ),
               ),
             );
@@ -162,7 +161,7 @@ class AnimatedIconButton extends StatefulWidget {
 class _AnimatedIconButtonState extends State<AnimatedIconButton>
     with SingleTickerProviderStateMixin {
   late AnimationController _controller;
-  bool _isPressed = false;
+  // Removed unused _isPressed; scale animation alone indicates press.
 
   @override
   void initState() {
@@ -188,16 +187,13 @@ class _AnimatedIconButtonState extends State<AnimatedIconButton>
       message: widget.tooltip ?? '',
       child: GestureDetector(
         onTapDown: (_) {
-          setState(() => _isPressed = true);
           _controller.forward();
         },
         onTapUp: (_) {
-          setState(() => _isPressed = false);
           _controller.reverse();
           widget.onPressed?.call();
         },
         onTapCancel: () {
-          setState(() => _isPressed = false);
           _controller.reverse();
         },
         child: AnimatedBuilder(

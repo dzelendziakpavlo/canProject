@@ -269,3 +269,82 @@ flutter run
 ---
 
 **CAN Debug Pro** представляє собою повноцінне enterprise-ready рішення для automotive CAN bus моніторингу з використанням найсучасніших Flutter технологій! 🚗⚡
+
+Найважливіше додати
+1. Окремо показувати real hardware і inferred
+У UI варто розділити:
+
+Hardware telemetry — прямо отримано з TWAI;
+Application classification — висновок Flutter на основі counters і сценарію;
+Simulation — програмно згенерована помилка.
+Це прибере ризик, що bus_error_count буде помилково представлений як точний CRC або Form Error.
+
+2. Передавати telemetry sender
+Зараз BLE підключений до receiver, тому телефон бачить переважно receiver counters. Корисно додати в CAN/ BLE протокол:
+
+sender TEC;
+sender state;
+sender TX failed;
+sender bitrate;
+sender mode;
+sender uptime.
+Тоді можна буде чітко показувати, наприклад:
+
+
+Це значно сильніше для демонстрації ACK Error.
+
+3. Preflight із перевіркою CAN-трафіку
+BLE/GATT preflight уже є. Додати ще:
+
+FF10 знайдено;
+FF11 notifications працюють;
+FF12 notifications працюють;
+перший stats packet отримано;
+перший CAN frame отримано;
+rxTotal росте.
+Результат:
+
+
+4. Керовані сценарії прямо в застосунку
+Замість ручного перепрошивання для кожної демонстрації можна додати екран “Demo Scenarios”:
+
+Normal;
+No ACK;
+Overload;
+Speed mismatch;
+RTR;
+Extended ID.
+Застосунок показує, які #define треба виставити, який sender/receiver прошити та який результат очікується.
+
+Автоматично змінювати режим через BLE поки не обов’язково.
+
+Корисно, але другим пріоритетом
+окремий arbitrationLost diagnostic event;
+подія busSilent у session;
+події bleDisconnected, bleReconnectStarted, bleReconnectFailed;
+packet loss / sequence tracking;
+timestamp synchronization між sender, receiver і телефоном;
+raw telemetry viewer для JSON FF11/FF12;
+фільтр hardware / inferred / simulated;
+автоматичний test report для кожного сценарію.
+Що я б не додавав зараз
+Поки не варто витрачати час на:
+
+складний machine-learning anomaly detection;
+повноцінний J1939 decoder;
+ISO-TP;
+автоматичне керування fault injection через небезпечні фізичні режими;
+великий рефакторинг UI;
+cloud backend.
+Для курсової/магістерської роботи це вже буде зайвий обсяг.
+
+Реалістичний фінальний набір
+Я б залишив такий пріоритет:
+
+Розділити hardware та inferred errors.
+Додати sender telemetry.
+Посилити preflight до першого CAN-кадру.
+Додати Demo Scenarios screen.
+Додати raw telemetry viewer.
+Написати короткий acceptance checklist для всіх режимів.
+Після цих шести пунктів система буде не просто функціональною, а добре захищеною технічно: буде зрозуміло, що реально повідомив CAN-контролер, що вивела програма, і як саме помилку було відтворено.

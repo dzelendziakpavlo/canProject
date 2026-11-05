@@ -1,13 +1,21 @@
 import 'can_frame.dart';
+import 'can_stats.dart';
+import 'can_session_event.dart';
 import '../detection/can_error_checker.dart';
 
 /// Модель сесії CAN моніторингу
 class CanSession {
+  static const int currentSchemaVersion = 2;
+
   final String id;
   final String name;
+  final String? sourceName;
+  final int schemaVersion;
   final DateTime startTime;
   final DateTime? endTime;
   final List<CanFrame> frames;
+  final List<CanStats> statsSnapshots;
+  final List<CanSessionEvent> events;
   final Map<CanErrorType, int> errorStats;
   final int totalFrames;
   final int errorFrames;
@@ -17,9 +25,13 @@ class CanSession {
   const CanSession({
     required this.id,
     required this.name,
+    this.sourceName,
+    this.schemaVersion = currentSchemaVersion,
     required this.startTime,
     this.endTime,
     required this.frames,
+    this.statsSnapshots = const [],
+    this.events = const [],
     required this.errorStats,
     required this.totalFrames,
     required this.errorFrames,
@@ -32,8 +44,12 @@ class CanSession {
     return CanSession(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       name: name,
+      sourceName: null,
+      schemaVersion: currentSchemaVersion,
       startTime: DateTime.now(),
       frames: [],
+      statsSnapshots: const [],
+      events: const [],
       errorStats: {for (var type in CanErrorType.values) type: 0},
       totalFrames: 0,
       errorFrames: 0,
@@ -44,18 +60,26 @@ class CanSession {
 
   /// Оновити сесію з новими даними
   CanSession updateWith({
+    String? sourceName,
     List<CanFrame>? frames,
+    List<CanStats>? statsSnapshots,
+    List<CanSessionEvent>? events,
     Map<CanErrorType, int>? errorStats,
     int? totalFrames,
     int? errorFrames,
     double? errorRate,
+    int? schemaVersion,
   }) {
     return CanSession(
       id: id,
       name: name,
+      sourceName: sourceName ?? this.sourceName,
+      schemaVersion: schemaVersion ?? this.schemaVersion,
       startTime: startTime,
       endTime: endTime,
       frames: frames ?? this.frames,
+      statsSnapshots: statsSnapshots ?? this.statsSnapshots,
+      events: events ?? this.events,
       errorStats: errorStats ?? this.errorStats,
       totalFrames: totalFrames ?? this.totalFrames,
       errorFrames: errorFrames ?? this.errorFrames,
@@ -69,9 +93,13 @@ class CanSession {
     return CanSession(
       id: id,
       name: name,
+      sourceName: sourceName,
+      schemaVersion: schemaVersion,
       startTime: startTime,
       endTime: DateTime.now(),
       frames: frames,
+      statsSnapshots: statsSnapshots,
+      events: events,
       errorStats: errorStats,
       totalFrames: totalFrames,
       errorFrames: errorFrames,
@@ -116,9 +144,13 @@ class CanSession {
     return {
       'id': id,
       'name': name,
+      'sourceName': sourceName,
+      'schemaVersion': schemaVersion,
       'startTime': startTime.toIso8601String(),
       'endTime': endTime?.toIso8601String(),
       'frames': frames.map((f) => f.toJson()).toList(),
+      'statsSnapshots': statsSnapshots.map((stats) => stats.toJson()).toList(),
+      'events': events.map((event) => event.toJson()).toList(),
       'errorStats': errorStats.map((k, v) => MapEntry(k.toString(), v)),
       'totalFrames': totalFrames,
       'errorFrames': errorFrames,
@@ -129,12 +161,27 @@ class CanSession {
 
   /// Створення з Map
   factory CanSession.fromJson(Map<String, dynamic> json) {
+    final rawSchemaVersion = json['schemaVersion'];
+    final parsedSchemaVersion = rawSchemaVersion is int
+        ? rawSchemaVersion
+        : int.tryParse(rawSchemaVersion?.toString() ?? '') ?? 1;
+
     return CanSession(
       id: json['id'],
       name: json['name'],
+      sourceName: json['sourceName'] as String?,
+      schemaVersion: parsedSchemaVersion,
       startTime: DateTime.parse(json['startTime']),
       endTime: json['endTime'] != null ? DateTime.parse(json['endTime']) : null,
       frames: (json['frames'] as List?)?.map((f) => CanFrame.fromJson(f)).toList() ?? [],
+      statsSnapshots: (json['statsSnapshots'] as List?)
+          ?.map((stats) => CanStats.fromStoredJson(Map<String, dynamic>.from(stats as Map)))
+          .toList() ??
+          const [],
+      events: (json['events'] as List?)
+          ?.map((event) => CanSessionEvent.fromJson(Map<String, dynamic>.from(event as Map)))
+          .toList() ??
+          const [],
       errorStats: (json['errorStats'] as Map<String, dynamic>?)?.map(
         (k, v) => MapEntry(
           CanErrorType.values.firstWhere((e) => e.toString() == k),

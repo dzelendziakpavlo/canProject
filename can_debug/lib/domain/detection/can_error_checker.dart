@@ -15,11 +15,14 @@ enum CanErrorType {
   busOffError,     // Bus-off condition
 }
 
+enum CanErrorOrigin { hardware, inferred, simulated }
+
 /// Detailed error information
 class CanErrorInfo {
   final CanErrorType type;
   final String description;
   final int severity; // 1-5 (1=low, 5=critical)
+  final CanErrorOrigin origin;
   final DateTime timestamp;
   final Map<String, dynamic> details;
 
@@ -27,6 +30,7 @@ class CanErrorInfo {
     required this.type,
     required this.description,
     required this.severity,
+    this.origin = CanErrorOrigin.inferred,
     DateTime? timestamp,
     this.details = const {},
   }) : timestamp = timestamp ?? DateTime.now();
@@ -43,6 +47,35 @@ class CanErrorInfo {
   }
 
   String get typeText => type.toString().split('.').last;
+
+  Map<String, dynamic> toJson() => {
+        'type': type.name,
+        'description': description,
+        'severity': severity,
+        'origin': origin.name,
+        'timestamp': timestamp.toIso8601String(),
+        'details': details,
+      };
+
+  factory CanErrorInfo.fromJson(Map<String, dynamic> json) => CanErrorInfo(
+        type: CanErrorType.values.firstWhere(
+          (value) => value.name == json['type'],
+          orElse: () => CanErrorType.none,
+        ),
+        description: json['description'] as String? ?? '',
+        severity: (json['severity'] as num?)?.toInt() ?? 1,
+        origin: CanErrorOrigin.values.firstWhere(
+          (value) => value.name == json['origin'],
+          orElse: () => CanErrorOrigin.inferred,
+        ),
+        timestamp: json['timestamp'] == null
+            ? null
+            : DateTime.tryParse(json['timestamp'].toString()),
+        details: (json['details'] as Map?)?.map(
+              (key, value) => MapEntry(key.toString(), value),
+            ) ??
+            const {},
+      );
 }
 
 /// CAN Error Checker for detecting and analyzing frame errors
@@ -65,12 +98,12 @@ class CanErrorChecker {
   List<CanErrorInfo> analyzeFrame(CanFrame frame) {
     final errors = <CanErrorInfo>[];
 
-    // Check CRC error (already implemented in frame)
     if (frame.isCorrupted) {
       errors.add(CanErrorInfo(
         type: CanErrorType.crcError,
-        description: 'CRC checksum mismatch detected',
+        description: 'Виявлено невідповідність контрольної суми CRC',
         severity: 3,
+        origin: CanErrorOrigin.simulated,
         details: {
           'frameId': frame.id,
           'expectedCrc': _calculateExpectedCrc(frame),
@@ -78,10 +111,7 @@ class CanErrorChecker {
         },
       ));
     }
-
-    // Simulate additional error types
     errors.addAll(_simulateProtocolErrors(frame));
-    
     return errors;
   }
 
@@ -99,6 +129,7 @@ class CanErrorChecker {
         type: CanErrorType.stuffingError,
         description: 'Bit stuffing violation: More than 5 consecutive identical bits',
         severity: 2,
+        origin: CanErrorOrigin.simulated,
         details: {
           'position': frameRandom.nextInt(64), // Bit position in frame
           'sequence': _generateBadStuffingSequence(frameRandom),
@@ -112,6 +143,7 @@ class CanErrorChecker {
         type: CanErrorType.formatError,
         description: 'Frame format violation in reserved bits',
         severity: 3,
+        origin: CanErrorOrigin.simulated,
         details: {
           'fieldType': _getRandomFormatErrorField(frameRandom),
           'expectedValue': '0',
@@ -126,6 +158,7 @@ class CanErrorChecker {
         type: CanErrorType.ackError,
         description: 'No acknowledgment received from any node',
         severity: 4,
+        origin: CanErrorOrigin.simulated,
         details: {
           'ackSlot': 'recessive',
           'expectedState': 'dominant',
@@ -140,6 +173,7 @@ class CanErrorChecker {
         type: CanErrorType.overloadError,
         description: 'Bus overload condition detected',
         severity: 4,
+        origin: CanErrorOrigin.simulated,
         details: {
           'overloadFlags': frameRandom.nextInt(3) + 1,
           'cause': _getRandomOverloadCause(frameRandom),
@@ -153,6 +187,7 @@ class CanErrorChecker {
         type: CanErrorType.formError,
         description: 'Form error in fixed format field',
         severity: 2,
+        origin: CanErrorOrigin.simulated,
         details: {
           'field': _getRandomFormErrorField(frameRandom),
           'bitPosition': frameRandom.nextInt(8),

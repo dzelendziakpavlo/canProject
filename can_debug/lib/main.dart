@@ -3,8 +3,10 @@ import 'package:flutter/material.dart';
 import 'core/dependency_injection.dart';
 import 'core/theme.dart';
 import 'domain/services/can_session_service.dart';
+import 'domain/services/auth_session_service.dart';
 import 'screens/dashboard_screen.dart';
-import 'screens/launcher_screen.dart';
+import 'screens/launcher_screen.dart'; // legacy launcher (optional)
+import 'screens/welcome_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/register_screen.dart';
 import 'presentation/screens/monitor_screen.dart';
@@ -19,6 +21,8 @@ void main() async {
   
   // Initialize session service
   await CanSessionService.instance.initialize();
+  // Initialize auth session
+  await AuthSessionService.instance.initialize();
   
   runApp(const MyApp());
 }
@@ -28,14 +32,18 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
+  // Choose initial route based on auth session
+  final initialRoute = AuthSessionService.instance.isLoggedIn ? '/dashboard' : '/welcome';
+  return MaterialApp(
       title: 'CAN Debug Pro',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.darkTheme,
       themeMode: ThemeMode.dark,
-      initialRoute: '/',
+      // New flow: Welcome -> Login -> Dashboard
+  initialRoute: initialRoute,
       routes: {
-        '/': (_) => const LauncherScreen(),
+        '/': (_) => const LauncherScreen(), // keep old path just in case
+        '/welcome': (_) => const WelcomeScreen(),
         '/login': (_) => const LoginScreen(),
         '/register': (_) => const RegisterScreen(),
         '/dashboard': (_) => const DashboardScreen(),

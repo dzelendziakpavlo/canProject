@@ -248,10 +248,14 @@ class ProfessionalErrorRateChart extends StatelessWidget {
 /// Професійний pie chart для розподілу типів помилок
 class ErrorTypeDistributionChart extends StatelessWidget {
   final Map<CanErrorType, int> errorStats;
+  final double height;
+  final void Function(CanErrorType type)? onSliceTap;
 
   const ErrorTypeDistributionChart({
     super.key,
     required this.errorStats,
+    this.height = 200,
+    this.onSliceTap,
   });
 
   @override
@@ -260,7 +264,7 @@ class ErrorTypeDistributionChart extends StatelessWidget {
     
     if (totalErrors == 0) {
       return Container(
-        height: 200,
+        height: height,
         decoration: BoxDecoration(
           color: Theme.of(context).cardColor,
           borderRadius: BorderRadius.circular(12),
@@ -281,8 +285,19 @@ class ErrorTypeDistributionChart extends StatelessWidget {
       );
     }
 
+    // Prepare ranked top errors (max 6) for compact view and stable indexing
+    final ranked = errorStats.entries
+        .where((e) => e.value > 0)
+        .toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final top = ranked.take(6).toList();
+
+    // Compute radii to make donut slimmer & smaller (user requested smaller ring sections)
+    final outerRadius = (height * 0.32).clamp(32, 34).toDouble();
+    final innerRadius = (outerRadius * 0.28).clamp(18, outerRadius - 10);
+
     return Container(
-      height: 200,
+      height: height+50,
       padding: const EdgeInsets.all(16.0),
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
@@ -312,23 +327,27 @@ class ErrorTypeDistributionChart extends StatelessWidget {
                   flex: 2,
                   child: PieChart(
                     PieChartData(
-                      sections: _getPieSections(totalErrors),
+                      sections: _getPieSectionsFrom(top, totalErrors, outerRadius),
                       borderData: FlBorderData(show: false),
-                      sectionsSpace: 2,
-                      centerSpaceRadius: 40,
+                      sectionsSpace: 1.5,
+                      centerSpaceRadius: innerRadius.toDouble(), // thinner ring
                       pieTouchData: PieTouchData(
+                        enabled: onSliceTap != null,
                         touchCallback: (FlTouchEvent event, pieTouchResponse) {
-                          // Handle touch events if needed
+                          if (onSliceTap == null) return;
+                          if (event is! FlTapUpEvent) return;
+                          final idx = pieTouchResponse?.touchedSection?.touchedSectionIndex;
+                          if (idx == null) return;
+                          if (idx >= 0 && idx < top.length) {
+                            onSliceTap!(top[idx].key);
+                          }
                         },
                       ),
                     ),
                   ),
                 ),
                 const SizedBox(width: 16),
-                Expanded(
-                  flex: 1,
-                  child: _buildLegend(context),
-                ),
+                Expanded(flex: 1, child: _buildLegend(context, top)),
               ],
             ),
           ),
@@ -337,68 +356,64 @@ class ErrorTypeDistributionChart extends StatelessWidget {
     );
   }
 
-  List<PieChartSectionData> _getPieSections(int totalErrors) {
+  List<PieChartSectionData> _getPieSectionsFrom(List<MapEntry<CanErrorType, int>> top, int totalErrors, double outerRadius) {
     final sections = <PieChartSectionData>[];
-
-    for (final entry in errorStats.entries) {
-      if (entry.value > 0) {
-        final percentage = (entry.value / totalErrors) * 100;
-        sections.add(
-          PieChartSectionData(
-            color: _getErrorTypeColor(entry.key),
-            value: entry.value.toDouble(),
-            title: '${percentage.toStringAsFixed(1)}%',
-            radius: 60,
-            titleStyle: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-            ),
-            titlePositionPercentageOffset: 0.6,
+    for (final entry in top) {
+      final percentage = (entry.value / totalErrors) * 100;
+      sections.add(
+        PieChartSectionData(
+          color: _getErrorTypeColor(entry.key),
+          value: entry.value.toDouble(),
+          title: '${percentage.toStringAsFixed(1)}%',
+          radius: outerRadius,
+          titleStyle: const TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.bold,
+            color: Colors.white,
           ),
-        );
-      }
+          titlePositionPercentageOffset: 0.55,
+        ),
+      );
     }
-
     return sections;
   }
 
-  Widget _buildLegend(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: errorStats.entries
-          .where((entry) => entry.value > 0)
-          .map((entry) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 12,
-                      height: 12,
-                      decoration: BoxDecoration(
-                        color: _getErrorTypeColor(entry.key),
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        _getErrorTypeName(entry.key),
-                        style: Theme.of(context).textTheme.bodySmall,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    Text(
-                      '${entry.value}',
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                  ],
+  Widget _buildLegend(BuildContext context, List<MapEntry<CanErrorType, int>> top) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 6,
+      children: top.map((entry) {
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.black12,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  color: _getErrorTypeColor(entry.key),
+                  shape: BoxShape.circle,
                 ),
-              ))
-          .toList(),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                _getErrorTypeName(entry.key),
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                '${entry.value}',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+        );
+      }).toList(),
     );
   }
 

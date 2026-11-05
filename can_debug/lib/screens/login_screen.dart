@@ -4,6 +4,7 @@ import 'package:flutter_animate/flutter_animate.dart';
 import '../repositories/auth_repository.dart';
 import '../core/theme.dart';
 import '../presentation/widgets/animated_widgets.dart';
+import '../domain/services/auth_session_service.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -38,7 +39,8 @@ class _LoginScreenState extends State<LoginScreen> {
 
     setState(() => _loading = true);
     try {
-      final user = await AuthRepository.instance.loginUser(username: username, password: password);
+  final user = await AuthRepository.instance.loginUser(username: username, password: password);
+  await AuthSessionService.instance.saveLogin(user.username);
       if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/dashboard', arguments: user.username);
     } on AuthException catch (e) {

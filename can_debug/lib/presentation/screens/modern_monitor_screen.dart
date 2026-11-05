@@ -174,6 +174,16 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
   Widget _buildLiveMonitorTab() {
     return BlocBuilder<CanFrameBloc, CanFrameState>(
       builder: (context, state) {
+        // Determine chart data depending on state (live vs snapshot)
+        final CanFrameMonitoring? monitoring = state is CanFrameMonitoring ? state : null;
+        final CanFrameStopped? stopped = state is CanFrameStopped ? state : null;
+        final isMonitoring = monitoring != null;
+        final isStopped = stopped != null;
+        final errorRateHistory = monitoring?.errorRateHistory ?? stopped?.errorRateHistory ?? <double>[];
+        final errorStats = monitoring?.errorStats ?? stopped?.errorStats ?? {for (var t in CanErrorType.values) t: 0};
+        final currentErrorRate = monitoring?.currentErrorRate ?? stopped?.currentErrorRate ?? 0.0;
+        final isRunning = monitoring?.isRunning ?? false;
+
         return Column(
           children: [
             // Statistics Panel
@@ -181,16 +191,16 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
             
             const Divider(height: 1),
             
-            // Live Error Rate Chart
-            if (state is CanFrameMonitoring) ...[
+            // Live/Snapshot Error Rate Chart
+            if (isMonitoring || isStopped) ...[
               Container(
                 height: 220,
                 padding: const EdgeInsets.all(16.0),
                 child: ProfessionalErrorRateChart(
-                  errorRateHistory: state.errorRateHistory,
-                  errorStats: state.errorStats,
-                  currentErrorRate: state.currentErrorRate,
-                  isRunning: state.isRunning,
+                  errorRateHistory: errorRateHistory,
+                  errorStats: errorStats,
+                  currentErrorRate: currentErrorRate,
+                  isRunning: isRunning,
                 ),
               ),
               
@@ -201,9 +211,7 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
             _buildFrameListHeader(),
             
             // Frame List
-            Expanded(
-              child: _buildFrameList(state),
-            ),
+            Expanded(child: _buildFrameList(state)),
           ],
         );
       },
@@ -213,10 +221,18 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
   Widget _buildAnalyticsTab() {
     return BlocBuilder<CanFrameBloc, CanFrameState>(
       builder: (context, state) {
-        if (state is! CanFrameMonitoring) {
+        final monitoringState = state is CanFrameMonitoring ? state : null;
+        final stoppedState = state is CanFrameStopped ? state : null;
+        final hasData = monitoringState != null || stoppedState != null;
+        final errorStats = monitoringState?.errorStats ?? stoppedState?.errorStats ?? {for (var t in CanErrorType.values) t: 0};
+        final framesPerSecond = monitoringState?.framesPerSecond ?? 0;
+        final errorRatePercentage = monitoringState?.errorRatePercentage ?? _calculateStoppedErrorRate(stoppedState);
+        final lastFrameTime = monitoringState?.lastFrameTime;
+
+        if (!hasData) {
           return const Center(
             child: Text(
-              'Start monitoring to see analytics',
+              'No analytics available. Start monitoring to gather data.',
               style: TextStyle(color: Colors.grey),
             ),
           );
@@ -226,20 +242,21 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
           padding: const EdgeInsets.all(16.0),
           child: Column(
             children: [
-              // Error Distribution Pie Chart
-              ErrorTypeDistributionChart(
-                errorStats: state.errorStats,
+              // Header banner indicating live vs snapshot
+              _buildSnapshotBanner(monitoringState != null),
+              const SizedBox(height: 12),
+              ErrorTypeDistributionChart(errorStats: errorStats),
+              const SizedBox(height: 16),
+              _buildSnapshotPerformanceMetrics(
+                isLive: monitoringState != null,
+                fps: framesPerSecond,
+                errorRate: errorRatePercentage,
+                lastFrame: lastFrameTime,
+                totalFrames: monitoringState?.totalFrames ?? stoppedState?.totalFrames ?? 0,
+                errorFrames: monitoringState?.errorFrames ?? stoppedState?.errorFrames ?? 0,
               ),
-              
               const SizedBox(height: 16),
-              
-              // Performance Metrics
-              _buildPerformanceMetrics(state),
-              
-              const SizedBox(height: 16),
-              
-              // Detailed Statistics
-              _buildDetailedStatistics(state),
+              _buildSnapshotDetailedStatistics(errorStats),
             ],
           ),
         );
@@ -250,17 +267,92 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
   Widget _buildNetworkTab() {
     return BlocBuilder<CanFrameBloc, CanFrameState>(
       builder: (context, state) {
-        final frames = state is CanFrameMonitoring ? state.frames : <CanFrame>[];
+        final frames = state is CanFrameMonitoring
+            ? state.frames
+            : state is CanFrameStopped
+                ? state.frames
+                : <CanFrame>[];
         final isRunning = state is CanFrameMonitoring && state.isRunning;
-        
-        return Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: CanNetworkTopologyView(
-            frames: frames,
-            isRunning: isRunning,
-          ),
+        return Column(
+          children: [
+            _buildNetworkInfoBar(isRunning, frames.length),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: CanNetworkTopologyView(
+                  frames: frames,
+                  isRunning: isRunning,
+                ),
+              ),
+            ),
+            _buildNetworkFooterExplanation(),
+          ],
         );
       },
+    );
+  }
+
+  Widget _buildNetworkInfoBar(bool isRunning, int frameCount) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey.shade800,
+        border: const Border(bottom: BorderSide(color: Colors.black12)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.hub, color: Colors.blue.shade200, size: 20),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Live CAN topology: dynamic ECU/activity discovery based on recent frames',
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          const SizedBox(width: 12),
+          _buildMiniBadge(isRunning ? 'RUNNING' : 'IDLE', isRunning ? Colors.green : Colors.red),
+          const SizedBox(width: 8),
+          _buildMiniBadge('$frameCount frames', Colors.blueGrey.shade300),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMiniBadge(String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withOpacity(0.4)),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+  Widget _buildNetworkFooterExplanation() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey.shade900,
+        border: const Border(top: BorderSide(color: Colors.black26)),
+      ),
+      child: const Text(
+        'Network tab demo: visualizes a simplified CAN bus topology.\n'
+        '• Central "CAN Bus" hub connects predefined ECUs (Engine, ABS, Airbag, BCM, Cluster).\n'
+        '• Active nodes pulse green based on IDs in the latest frames (last 50).\n'
+        '• New CAN IDs appear as dynamic NODE_xx tiles auto-linked to the bus.\n'
+        '• Layout menu lets you test hierarchical vs force vs circular graph algorithms.\n'
+        'Use this demo to reason about activity distribution & bus participation — not a full physical wiring map.',
+        style: TextStyle(color: Colors.white60, fontSize: 11, height: 1.35),
+      ),
     );
   }
 
@@ -283,6 +375,20 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
                 Expanded(child: _buildStatCard('Error Frames', '${state.errorFrames}')),
                 Expanded(child: _buildStatCard('Error Rate', '${state.errorRatePercentage.toStringAsFixed(1)}%')),
                 Expanded(child: _buildStatCard('FPS', '${state.framesPerSecond.toStringAsFixed(1)}')),
+              ],
+            );
+          } else if (state is CanFrameStopped) {
+            final total = state.totalFrames;
+            final errors = state.errorFrames;
+            final rate = state.currentErrorRate;
+            final fps = state.framesPerSecond;
+
+            return Row(
+              children: [
+                Expanded(child: _buildStatCard('Total Frames', '$total')),
+                Expanded(child: _buildStatCard('Error Frames', '$errors')),
+                Expanded(child: _buildStatCard('Error Rate', '${rate.toStringAsFixed(1)}%')),
+                Expanded(child: _buildStatCard('FPS', fps > 0 ? fps.toStringAsFixed(1) : '0.0')),
               ],
             );
           }
@@ -326,7 +432,7 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
   }
 
   Widget _buildFrameList(CanFrameState state) {
-    if (state is! CanFrameMonitoring) {
+    if (state is CanFrameInitial) {
       return const Center(
         child: Text(
           'Start monitoring to see CAN frames',
@@ -335,7 +441,13 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
       );
     }
 
-    if (state.recentFrames.isEmpty) {
+    final recentFrames = state is CanFrameMonitoring
+        ? state.recentFrames
+        : state is CanFrameStopped
+            ? state.frames.take(50).toList()
+            : <CanFrame>[];
+
+    if (recentFrames.isEmpty) {
       return const Center(
         child: Text(
           'No frames received yet',
@@ -345,9 +457,9 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
     }
 
     return ListView.builder(
-      itemCount: state.recentFrames.length,
+      itemCount: recentFrames.length,
       itemBuilder: (context, index) {
-        final frame = state.recentFrames[state.recentFrames.length - 1 - index];
+        final frame = recentFrames[recentFrames.length - 1 - index];
         return _buildFrameListItem(context, frame);
       },
     );
@@ -422,7 +534,17 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
     );
   }
 
-  Widget _buildPerformanceMetrics(CanFrameMonitoring state) {
+  // Legacy live-only performance metrics kept for reference; replaced by snapshot aware version.
+  // (Can remove if not needed later.)
+
+  Widget _buildSnapshotPerformanceMetrics({
+    required bool isLive,
+    required double fps,
+    required double errorRate,
+    required DateTime? lastFrame,
+    required int totalFrames,
+    required int errorFrames,
+  }) {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16.0),
@@ -430,41 +552,86 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Performance Metrics',
+              isLive ? 'Live Performance Metrics' : 'Snapshot Metrics (Paused)',
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                fontWeight: FontWeight.bold,
-              ),
+                    fontWeight: FontWeight.bold,
+                  ),
             ),
             const SizedBox(height: 16),
             Row(
               children: [
-                Expanded(
-                  child: _buildMetricItem(
-                    'Frames/sec',
-                    state.framesPerSecond.toStringAsFixed(1),
-                    Icons.speed,
-                  ),
-                ),
-                Expanded(
-                  child: _buildMetricItem(
-                    'Avg Error Rate',
-                    '${state.errorRatePercentage.toStringAsFixed(2)}%',
-                    Icons.error_outline,
-                  ),
-                ),
-                Expanded(
-                  child: _buildMetricItem(
-                    'Runtime',
-                    _formatDuration(state.lastFrameTime ?? DateTime.now()),
-                    Icons.timer,
-                  ),
-                ),
+                Expanded(child: _buildMetricItem('Frames', '$totalFrames', Icons.list)),
+                Expanded(child: _buildMetricItem('Errors', '$errorFrames', Icons.error)),
+                Expanded(child: _buildMetricItem('Err Rate', '${errorRate.toStringAsFixed(2)}%', Icons.percent)),
+                Expanded(child: _buildMetricItem(isLive ? 'FPS' : 'FPS (stopped)', isLive ? fps.toStringAsFixed(1) : '0.0', Icons.speed)),
               ],
             ),
+            if (lastFrame != null) ...[
+              const SizedBox(height: 12),
+              Text('Last Frame: ${lastFrame.toIso8601String()}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+            ],
           ],
         ),
       ),
     );
+  }
+
+  Widget _buildSnapshotDetailedStatistics(Map<CanErrorType, int> errorStats) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Detailed Statistics', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+            ...errorStats.entries.where((e) => e.value > 0).map((e) => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(_getErrorTypeName(e.key)),
+                      Text('${e.value}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                )),
+            if (errorStats.values.every((v) => v == 0)) const Text('No errors detected', style: TextStyle(color: Colors.grey)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSnapshotBanner(bool isLive) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: isLive ? Colors.green.shade50 : Colors.amber.shade50,
+        border: Border.all(color: isLive ? Colors.green.shade200 : Colors.amber.shade300),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(isLive ? Icons.play_circle_fill : Icons.pause_circle_filled,
+              color: isLive ? Colors.green : Colors.amber),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              isLive
+                  ? 'Live monitoring in progress — analytics updating in real time.'
+                  : 'Monitoring paused — showing snapshot analytics at the moment of stop.',
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  double _calculateStoppedErrorRate(CanFrameStopped? stopped) {
+    if (stopped == null || stopped.totalFrames == 0) return 0.0;
+    return (stopped.errorFrames / stopped.totalFrames) * 100.0;
   }
 
   Widget _buildMetricItem(String title, String value, IconData icon) {
@@ -490,45 +657,7 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
     );
   }
 
-  Widget _buildDetailedStatistics(CanFrameMonitoring state) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Detailed Statistics',
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 16),
-            ...state.errorStats.entries
-                .where((entry) => entry.value > 0)
-                .map((entry) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(_getErrorTypeName(entry.key)),
-                      Text(
-                        '${entry.value}',
-                        style: const TextStyle(fontWeight: FontWeight.bold),
-                      ),
-                    ],
-                  ),
-                )),
-            if (state.errorStats.values.every((v) => v == 0))
-              const Text(
-                'No errors detected',
-                style: TextStyle(color: Colors.grey),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
+  // Legacy detailed statistics removed (replaced by snapshot variant).
 
   void _showFrameDetails(BuildContext context, CanFrame frame) {
     final errors = frame.errors.whereType<CanErrorInfo>().toList();
@@ -622,16 +751,7 @@ class _MonitorScreenViewState extends State<_MonitorScreenView>
     }
   }
 
-  String _formatDuration(DateTime startTime) {
-    final duration = DateTime.now().difference(startTime);
-    if (duration.inHours > 0) {
-      return '${duration.inHours}h ${duration.inMinutes % 60}m';
-    } else if (duration.inMinutes > 0) {
-      return '${duration.inMinutes}m ${duration.inSeconds % 60}s';
-    } else {
-      return '${duration.inSeconds}s';
-    }
-  }
+  // Legacy runtime formatter unused after snapshot redesign.
 }
 
 class _StatCard extends StatelessWidget {

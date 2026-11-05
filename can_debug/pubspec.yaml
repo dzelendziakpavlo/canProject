@@ -67,8 +67,16 @@ dependencies:
   lottie: ^2.7.0
   equatable: ^2.0.7
   
+  # 📡 Bluetooth LE
+  flutter_blue_plus: ^1.31.15
+  permission_handler: ^11.3.1
+
   # 💾 Local Storage
   shared_preferences: ^2.2.2
+  # Export & reporting
+  pdf: ^3.10.1
+  printing: ^5.11.0
+  file_selector: ^0.9.0
 
 dev_dependencies:
   flutter_test:

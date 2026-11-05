@@ -24,25 +24,44 @@ class _CanNetworkTopologyViewState extends State<CanNetworkTopologyView> {
   late Graph graph;
   late BuchheimWalkerConfiguration builder;
   late SugiyamaConfiguration sugiyamaBuilder;
-  
-  // Network nodes
-  final Map<int, Node> _nodes = {};
+
+  // Track active CAN IDs (recently seen)
   final Set<int> _activeNodes = {};
-  
+  // Map predefined ECU keys to well-known CAN IDs
+  final Map<String, int> _ecuMap = const {
+    'ENGINE_ECU': 0x7E8,
+    'TRANS_ECU': 0x7E9,
+    'ABS_ECU': 0x7EA,
+    'AIRBAG_ECU': 0x7EB,
+    'BCM_ECU': 0x7EC,
+    'CLUSTER_ECU': 0x7ED,
+  };
+
   LayoutType _currentLayout = LayoutType.hierarchical;
+  bool _rebuildScheduled = false;
+  bool _disposed = false;
 
   @override
   void initState() {
     super.initState();
     _initializeGraph();
+    _computeActiveNodes();
+    _scheduleGraphRebuild();
   }
 
   @override
   void didUpdateWidget(CanNetworkTopologyView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.frames != oldWidget.frames) {
-      _updateNetworkTopology();
+      _computeActiveNodes();
+      _scheduleGraphRebuild();
     }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
   }
 
   void _initializeGraph() {
@@ -60,67 +79,55 @@ class _CanNetworkTopologyViewState extends State<CanNetworkTopologyView> {
       ..levelSeparation = 80
       ..nodeSeparation = 80
       ..orientation = SugiyamaConfiguration.ORIENTATION_LEFT_RIGHT;
-    
-    _createInitialTopology();
   }
 
-  void _createInitialTopology() {
-    // Create main CAN bus node
-    final busNode = Node.Id('CAN_BUS');
-    _nodes[0] = busNode;
-    graph.addNode(busNode);
-    
-    // Create common automotive ECU nodes
-    _createEcuNode('ENGINE_ECU', 0x7E8, 'Engine Control Unit');
-    _createEcuNode('TRANS_ECU', 0x7E9, 'Transmission Control');
-    _createEcuNode('ABS_ECU', 0x7EA, 'ABS Control Unit');
-    _createEcuNode('AIRBAG_ECU', 0x7EB, 'Airbag Control Unit');
-    _createEcuNode('BCM_ECU', 0x7EC, 'Body Control Module');
-    _createEcuNode('CLUSTER_ECU', 0x7ED, 'Instrument Cluster');
-    
-    // Connect all ECUs to main bus
-    for (final nodeId in _nodes.keys) {
-      if (nodeId != 0) {
-        graph.addEdge(_nodes[0]!, _nodes[nodeId]!);
-      }
-    }
-  }
-
-  void _createEcuNode(String key, int canId, String description) {
-    final node = Node.Id(key);
-    _nodes[canId] = node;
-    graph.addNode(node);
-  }
-
-  void _updateNetworkTopology() {
-    // Track active nodes based on recent frames
+  void _computeActiveNodes() {
     _activeNodes.clear();
-    
-    // Get recent frames (last 50)
-    final recentFrames = widget.frames.length > 50 
+    // Consider recent frames only to avoid bloat
+    final recentFrames = widget.frames.length > 50
         ? widget.frames.sublist(widget.frames.length - 50)
         : widget.frames;
-    
-    for (final frame in recentFrames) {
-      _activeNodes.add(frame.id);
+    for (final f in recentFrames) {
+      _activeNodes.add(f.id);
     }
-    
-    // Add dynamic nodes for new CAN IDs
-    for (final canId in _activeNodes) {
-      if (!_nodes.containsKey(canId)) {
-        final nodeKey = 'NODE_${canId.toRadixString(16).toUpperCase()}';
-        final node = Node.Id(nodeKey);
-        _nodes[canId] = node;
-        graph.addNode(node);
-        
-        // Connect to main bus
-        if (_nodes.containsKey(0)) {
-          graph.addEdge(_nodes[0]!, node);
-        }
-      }
+  }
+
+  void _scheduleGraphRebuild() {
+    if (_rebuildScheduled || _disposed) return;
+    _rebuildScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_disposed) return;
+      _rebuildScheduled = false;
+      _rebuildGraph();
+    });
+  }
+
+  void _rebuildGraph() {
+    // Build a fresh graph to avoid mutating during layout and duplicate keys
+    final newGraph = Graph();
+    final bus = Node.Id('CAN_BUS');
+    newGraph.addNode(bus);
+
+    // Static ECU nodes connected to bus
+    for (final entry in _ecuMap.entries) {
+      final ecuNode = Node.Id(entry.key);
+      newGraph.addNode(ecuNode);
+      newGraph.addEdge(bus, ecuNode);
     }
 
-    setState(() {});
+    // Dynamic nodes for active CAN IDs not mapped to predefined ECUs
+    for (final canId in _activeNodes) {
+      if (_ecuMap.values.contains(canId)) continue;
+      final key = 'NODE_${canId.toRadixString(16).toUpperCase()}';
+      final node = Node.Id(key);
+      newGraph.addNode(node);
+      newGraph.addEdge(bus, node);
+    }
+
+    if (!mounted || _disposed) return;
+    setState(() {
+      graph = newGraph;
+    });
   }
 
   @override
@@ -150,37 +157,61 @@ class _CanNetworkTopologyViewState extends State<CanNetworkTopologyView> {
   }
 
   Widget _buildHeader(BuildContext context) {
+    final theme = Theme.of(context);
+    Widget title = Text(
+      'CAN Bus Network Topology',
+      style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+      overflow: TextOverflow.ellipsis,
+    );
+    Widget trailing = Wrap(
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: 12,
+      runSpacing: 6,
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: widget.isRunning ? Colors.green : Colors.red,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              '${_activeNodes.length} Active Nodes',
+              style: theme.textTheme.bodySmall,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
+        ),
+        _buildLayoutSelector(),
+      ],
+    );
     return Padding(
       padding: const EdgeInsets.all(16.0),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(
-            'CAN Bus Network Topology',
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          Row(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          if (constraints.maxWidth < 420) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                title,
+                const SizedBox(height: 12),
+                trailing,
+              ],
+            );
+          }
+          return Row(
             children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  color: widget.isRunning ? Colors.green : Colors.red,
-                  shape: BoxShape.circle,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                '${_activeNodes.length} Active Nodes',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
+              Expanded(child: title),
               const SizedBox(width: 16),
-              _buildLayoutSelector(),
+              Flexible(child: trailing),
             ],
-          ),
-        ],
+          );
+        },
       ),
     );
   }
@@ -344,26 +375,19 @@ class _CanNetworkTopologyViewState extends State<CanNetworkTopologyView> {
 
   bool _isNodeActive(String nodeId) {
     if (nodeId == 'CAN_BUS') return widget.isRunning;
-    
-    // Check if this node corresponds to any active CAN ID
+    // Dynamic nodes pattern: NODE_XXXXXXXX
     final parts = nodeId.split('_');
     if (parts.length > 1) {
       try {
         final canId = int.parse(parts[1], radix: 16);
         return _activeNodes.contains(canId);
-      } catch (e) {
-        // Ignore parsing errors
-      }
+      } catch (_) {}
     }
-    
-    // Check predefined ECU mappings
-    for (final entry in _nodes.entries) {
-      final node = entry.value;
-      if (node.key?.value == nodeId) {
-        return _activeNodes.contains(entry.key);
-      }
+    // Predefined ECU active if its mapped CAN ID is active
+    if (_ecuMap.containsKey(nodeId)) {
+      final canId = _ecuMap[nodeId];
+      return canId != null && _activeNodes.contains(canId);
     }
-    
     return false;
   }
 }

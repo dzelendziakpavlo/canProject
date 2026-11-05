@@ -1,8 +1,13 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 
 import '../core/theme.dart';
 import '../presentation/widgets/animated_widgets.dart';
+import '../domain/services/auth_session_service.dart';
+import '../domain/simulator/can_frame_simulator.dart';
+import '../presentation/screens/monitor_screen.dart';
+import '../presentation/screens/modern_monitor_screen.dart';
+import '../presentation/screens/ble_connect_screen.dart';
 
 class DashboardScreen extends StatelessWidget {
   const DashboardScreen({super.key});
@@ -52,7 +57,7 @@ class DashboardScreen extends StatelessWidget {
                           Text(
                             'Welcome back, $username',
                             style: theme.textTheme.bodyMedium?.copyWith(
-                              color: theme.colorScheme.onSurface.withOpacity(0.7),
+                              color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
                             ),
                           ),
                         ],
@@ -60,7 +65,11 @@ class DashboardScreen extends StatelessWidget {
                     ),
                     AnimatedIconButton(
                       icon: Icons.logout,
-                      onPressed: () => Navigator.pushReplacementNamed(context, '/login'),
+                      onPressed: () async {
+                        await AuthSessionService.instance.logout();
+                        if (!context.mounted) return;
+                        Navigator.pushReplacementNamed(context, '/login');
+                      },
                       tooltip: 'Logout',
                     ),
                   ],
@@ -103,7 +112,7 @@ class DashboardScreen extends StatelessWidget {
                               Text(
                                 'All automotive systems are operational',
                                 style: theme.textTheme.bodyMedium?.copyWith(
-                                  color: theme.colorScheme.onSurface.withOpacity(0.7),
+                                  color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
                                 ),
                                 textAlign: TextAlign.center,
                               ),
@@ -114,7 +123,7 @@ class DashboardScreen extends StatelessWidget {
                       
                       const SizedBox(height: 24),
                       
-                      // CAN Monitor Section
+                      // Simulation Section
                       AnimatedCard(
                         child: Padding(
                           padding: const EdgeInsets.all(24),
@@ -134,7 +143,7 @@ class DashboardScreen extends StatelessWidget {
                               ),
                               const SizedBox(height: 16),
                               Text(
-                                'CAN Bus Monitor',
+                                'Simulation',
                                 style: theme.textTheme.titleLarge?.copyWith(
                                   fontWeight: FontWeight.bold,
                                   color: theme.colorScheme.onSurface,
@@ -142,9 +151,9 @@ class DashboardScreen extends StatelessWidget {
                               ),
                               const SizedBox(height: 8),
                               Text(
-                                'Real-time CAN frame monitoring and analysis',
+                                'Run CAN bus simulation and monitor frames in real time',
                                 style: theme.textTheme.bodyMedium?.copyWith(
-                                  color: theme.colorScheme.onSurface.withOpacity(0.7),
+                                  color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
                                 ),
                                 textAlign: TextAlign.center,
                               ),
@@ -153,7 +162,14 @@ class DashboardScreen extends StatelessWidget {
                                 children: [
                                   Expanded(
                                     child: AnimatedButton(
-                                      onPressed: () => Navigator.pushNamed(context, '/monitor'),
+                                      onPressed: () => Navigator.push(
+                                        context,
+                                        MaterialPageRoute(
+                                          builder: (_) => MonitorScreen(
+                                            source: CanFrameSimulator(),
+                                          ),
+                                        ),
+                                      ),
                                       child: const Row(
                                         mainAxisAlignment: MainAxisAlignment.center,
                                         children: [
@@ -167,7 +183,12 @@ class DashboardScreen extends StatelessWidget {
                                   const SizedBox(width: 12),
                                   Expanded(
                                     child: AnimatedButton(
-                                      onPressed: () => Navigator.pushNamed(context, '/modern_monitor'),
+                                      onPressed: () => Navigator.push(
+                                        context,
+                                        MaterialPageRoute(
+                                          builder: (_) => const ModernMonitorScreen(),
+                                        ),
+                                      ),
                                       child: const Row(
                                         mainAxisAlignment: MainAxisAlignment.center,
                                         children: [
@@ -184,6 +205,129 @@ class DashboardScreen extends StatelessWidget {
                           ),
                         ),
                       ).animate().fadeIn(delay: 400.ms).slideX(begin: 0.3, end: 0),
+                      
+                      const SizedBox(height: 24),
+
+                      // Hardware Section
+                      AnimatedCard(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Column(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(16),
+                                decoration: BoxDecoration(
+                                  color: AppTheme.darkContainer,
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: Colors.blueAccent.withValues(alpha: 0.4),
+                                  ),
+                                ),
+                                child: const Icon(
+                                  Icons.bluetooth,
+                                  size: 40,
+                                  color: Colors.blueAccent,
+                                ),
+                              ),
+                              const SizedBox(height: 16),
+                              Text(
+                                'Real Stand (ESP32)',
+                                style: theme.textTheme.titleLarge?.copyWith(
+                                  fontWeight: FontWeight.bold,
+                                  color: theme.colorScheme.onSurface,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                'Connect to the physical CAN bus stand via Bluetooth LE',
+                                style: theme.textTheme.bodyMedium?.copyWith(
+                                  color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 24),
+                              SizedBox(
+                                width: double.infinity,
+                                child: AnimatedButton(
+                                  onPressed: () => Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => const BleConnectScreen(),
+                                    ),
+                                  ),
+                                  child: const Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(Icons.bluetooth_searching),
+                                      SizedBox(width: 8),
+                                      Text('Connect to Stand'),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ).animate().fadeIn(delay: 500.ms).slideX(begin: 0.3, end: 0),
+
+                      const SizedBox(height: 24),
+                      // Analytics Section
+                      AnimatedCard(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Column(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(16),
+                                decoration: BoxDecoration(
+                                  color: AppTheme.darkContainer,
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(color: AppTheme.primaryOrange.withValues(alpha: 0.3)),
+                                ),
+                                child: const Icon(
+                                  Icons.analytics,
+                                  size: 40,
+                                  color: AppTheme.primaryOrange,
+                                ),
+                              ),
+                              const SizedBox(height: 16),
+                              Text(
+                                'Analytics',
+                                style: theme.textTheme.titleLarge?.copyWith(
+                                  fontWeight: FontWeight.bold,
+                                  color: theme.colorScheme.onSurface,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                'Explore saved sessions with extended analytics, charts and insights',
+                                style: theme.textTheme.bodyMedium?.copyWith(
+                                  color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 24),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: AnimatedButton(
+                                      onPressed: () => Navigator.pushNamed(context, '/analytics'),
+                                      child: const Row(
+                                        mainAxisAlignment: MainAxisAlignment.center,
+                                        children: [
+                                          Icon(Icons.query_stats),
+                                          SizedBox(width: 8),
+                                          Text('Analytics Extension'),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ).animate().fadeIn(delay: 500.ms).slideX(begin: -0.3, end: 0),
                       
                       const SizedBox(height: 24),
                       
@@ -205,7 +349,7 @@ class DashboardScreen extends StatelessWidget {
                                     Text(
                                       'Live Data',
                                       style: theme.textTheme.bodyMedium?.copyWith(
-                                        color: theme.colorScheme.onSurface.withOpacity(0.7),
+                                        color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
                                       ),
                                     ),
                                     Text(
@@ -236,7 +380,7 @@ class DashboardScreen extends StatelessWidget {
                                     Text(
                                       'Network',
                                       style: theme.textTheme.bodyMedium?.copyWith(
-                                        color: theme.colorScheme.onSurface.withOpacity(0.7),
+                                        color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
                                       ),
                                     ),
                                     Text(
@@ -264,3 +408,4 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 }
+

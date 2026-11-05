@@ -1,26 +1,35 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 
 import '../../domain/models/can_frame.dart';
+import '../../domain/models/can_stats.dart';
+import '../../domain/models/can_session.dart';
+import '../../domain/models/can_session_event.dart';
+import '../../domain/source/can_frame_source.dart';
 import '../../domain/simulator/can_frame_simulator.dart';
 import '../../domain/detection/can_error_checker.dart';
+import '../../domain/detection/can_health_analyzer.dart';
+import '../../domain/detection/can_anomaly_analyzer.dart';
 import '../../domain/services/can_session_service.dart';
 import '../../core/theme.dart';
 import '../widgets/animated_widgets.dart';
 
 /// Monitor screen that displays live CAN frame data
 class MonitorScreen extends StatefulWidget {
-  const MonitorScreen({super.key});
+  final CanFrameSource? source;
+  const MonitorScreen({super.key, this.source});
 
   @override
   State<MonitorScreen> createState() => _MonitorScreenState();
 }
 
 class _MonitorScreenState extends State<MonitorScreen> {
-  late CanFrameSimulator _simulator;
+  late CanFrameSource _source;
   late StreamSubscription<CanFrame> _subscription;
   final CanErrorChecker _errorChecker = CanErrorChecker();
+  final CanHealthAnalyzer _healthAnalyzer = CanHealthAnalyzer();
+  final CanAnomalyAnalyzer _anomalyAnalyzer = const CanAnomalyAnalyzer();
   final CanSessionService _sessionService = CanSessionService.instance;
   
   final List<CanFrame> _frames = [];
@@ -39,77 +48,437 @@ class _MonitorScreenState extends State<MonitorScreen> {
   final int _maxHistoryPoints = 50; // Keep last 50 data points
   
   bool _isRunning = false;
-  
+
+  // BLE connection state (null for simulator)
+  SourceState? _sourceState;
+  StreamSubscription<SourceState>? _stateSub;
+
+  // Phase 5: frame batching — decouples CAN bus rate from UI render rate
+  final List<CanFrame> _pendingFrames = [];
+  final List<DateTime> _recentFrameTimes = [];
+  Timer? _uiTimer;
+
+  // Phase 5: TWAI hardware stats (null for simulator)
+  CanStats? _latestStats;
+  StreamSubscription<CanStats>? _statsStreamSub;
+
+  // Frame-timeout detection: if BLE source is streaming but no frames arrive for
+  // this duration, we show a "bus silent" warning (wire disconnected, etc.)
+  static const _frameTimeoutDuration = Duration(seconds: 3);
+  DateTime? _lastFrameAt;
+  double _framesPerSecond = 0.0;
+  int _reconnectCount = 0;
+  CanHealthReport _healthReport = const CanHealthReport(
+    score: 100,
+    severity: SessionSeverity.normal,
+    findings: [],
+  );
+  List<CanAnomaly> _anomalies = const [];
+  // ignore: prefer_final_fields
+  bool _busIsSilent = false;
+
+  void _recordSourceEvent({
+    required CanSessionEventType type,
+    required String message,
+    Map<String, dynamic> data = const {},
+  }) {
+    _sessionService.recordSessionEvent(
+      CanSessionEvent.create(
+        type: type,
+        message: message,
+        sourceName: _source.name,
+        data: {
+          'sourceName': _source.name,
+          'sourceState': _sourceState?.name,
+          'monitorMode': _source.statsStream != null ? 'hardware' : 'simulator',
+          ...data,
+        },
+      ),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
-    _simulator = CanFrameSimulator();
+    _source = widget.source ?? CanFrameSimulator();
+    _stateSub = _source.stateStream.listen((s) {
+      final previousState = _sourceState;
+      if (s == SourceState.reconnecting) _reconnectCount++;
+      if (mounted) setState(() => _sourceState = s);
+      _recordSourceEvent(
+        type: CanSessionEventType.sourceStateChanged,
+        message: 'Source state changed to $s',
+        data: {
+          'previousState': previousState?.name,
+          'newState': s.name,
+          'isStreaming': s == SourceState.streaming,
+          'isDisconnected': s == SourceState.disconnected,
+          'reconnectCount': _reconnectCount,
+        },
+      );
+    });
+    _statsStreamSub = _source.statsStream?.listen((stats) {
+      if (!mounted) return;
+      _sessionService.recordStatsSnapshot(stats);
+      _recordSourceEvent(
+        type: CanSessionEventType.statsSnapshot,
+        message: 'TWAI stats snapshot received',
+        data: {
+          'rxTotal': stats.rxTotal,
+          'txErrorCounter': stats.txErrorCounter,
+          'rxErrorCounter': stats.rxErrorCounter,
+          'busState': stats.busState,
+          'rxMissed': stats.rxMissed,
+          'busErrorCount': stats.busErrorCount,
+          'arbLostCount': stats.arbLostCount,
+          'txFailedCount': stats.txFailedCount,
+          'rxOverrunCount': stats.rxOverrunCount,
+          'isErrorPassive': stats.isErrorPassive,
+          'isErrorWarning': stats.isErrorWarning,
+          'isBusOff': stats.isBusOff,
+          'isRecovering': stats.isRecovering,
+          'isNoAckMode': stats.isNoAckMode,
+          'isSpeedMismatchDemo': stats.isSpeedMismatchDemo,
+          'telemetrySchema': stats.telemetrySchema,
+          'nodeName': stats.nodeName,
+          'firmwareVersion': stats.firmwareVersion,
+          'uptimeMs': stats.uptimeMs,
+          'bitrate': stats.bitrate,
+          'reasonCode': stats.reasonCode,
+        },
+      );
+      final prev = _latestStats;
+
+      // TWAI deltas since last stats packet (arrives every ~1 s from ESP32)
+      final errorDelta  = stats.busErrorCount - (prev?.busErrorCount ?? stats.busErrorCount);
+      final rxDelta     = stats.rxTotal       - (prev?.rxTotal       ?? stats.rxTotal);
+      final tecDelta    = stats.txErrorCounter - (prev?.txErrorCounter ?? stats.txErrorCounter);
+      final recDelta    = stats.rxErrorCounter - (prev?.rxErrorCounter ?? stats.rxErrorCounter);
+      final arbDelta    = stats.arbLostCount   - (prev?.arbLostCount   ?? stats.arbLostCount);
+      final txFailDelta  = stats.txFailedCount  - (prev?.txFailedCount  ?? stats.txFailedCount);
+      final ovrDelta     = stats.rxOverrunCount - (prev?.rxOverrunCount ?? stats.rxOverrunCount);
+      final missedDelta  = stats.rxMissed       - (prev?.rxMissed       ?? stats.rxMissed);
+
+      if (prev != null) {
+        // Hardware-mode chart: real error rate from TWAI counters
+        final total = errorDelta + rxDelta;
+        final hwRate = total > 0 ? (errorDelta / total) * 100.0 : 0.0;
+        _errorRateHistory.add(hwRate.clamp(0.0, 100.0));
+        if (_errorRateHistory.length > _maxHistoryPoints) _errorRateHistory.removeAt(0);
+
+        // One-time frame on transition into Error Warning (TEC/REC crosses 96).
+        if (stats.isErrorWarning && !prev.isErrorWarning) {
+          _pendingFrames.add(_makeErrorWarningFrame(stats));
+        }
+
+        // Inject synthetic frames so errors appear in the frame list.
+        // txFailDelta and ovrDelta are checked first — they are exact hardware signals,
+        // not heuristics, so they take precedence over the generic bus-error frame.
+        if (txFailDelta > 0) {
+          _pendingFrames.add(_makeTxFailFrame(stats, txFailDelta));
+        }
+        if (ovrDelta > 0) {
+          _pendingFrames.add(_makeOverrunFrame(stats, ovrDelta));
+        }
+        // rx_missed_count rises when the TWAI driver's software RX queue is full
+        // (softer than rx_overrun but more commonly triggered by MODE 2 burst).
+        if (missedDelta > 0) {
+          _pendingFrames.add(_makeMissedFrame(stats, missedDelta));
+        }
+        final residual = errorDelta - txFailDelta;
+        if (residual > 0) {
+          if (stats.isNoAckMode) {
+            // Every bus error is ACK error by definition — RECEIVER sends no ACK bits.
+            _pendingFrames.add(_makeNoAckErrorFrame(stats, residual));
+          } else if (stats.isSpeedMismatchDemo) {
+            // Speed mismatch produces both stuffing and format errors simultaneously.
+            // Inject one of each so both types appear in the frame list.
+            _pendingFrames.add(_makeStuffingErrorFrame(stats, residual));
+            if (residual > 1) {
+              _pendingFrames.add(_makeFormatErrorFrame(stats, residual));
+            }
+          } else {
+            _pendingFrames.add(_makeTwaiErrorFrame(stats, residual, tecDelta, recDelta));
+          }
+        }
+        if (arbDelta > 0) {
+          _pendingFrames.add(_makeArbLostFrame(stats, arbDelta));
+        }
+      }
+
+      setState(() => _latestStats = stats);
+      _updateHealthReport();
+      _updateAnomalyReport();
+    });
     _setupFrameListener();
     _startSimulation();
   }
 
   @override
   void dispose() {
+    _uiTimer?.cancel();
+    _stateSub?.cancel();
+    _statsStreamSub?.cancel();
     _subscription.cancel();
-    _simulator.dispose();
+    _source.dispose();
     super.dispose();
   }
 
-  /// Setup listener for incoming CAN frames
+  /// Subscribe to frame stream — frames go into a buffer, not directly into setState.
+  /// The UI timer flushes the buffer at 20 fps, keeping the render thread smooth
+  /// even when the ESP32 sends 200+ frames/s on a loaded CAN bus.
   void _setupFrameListener() {
-    _subscription = _simulator.frameStream.listen((frame) {
-      setState(() {
+    _subscription = _source.frameStream.listen(_pendingFrames.add);
+    _uiTimer?.cancel();
+    _uiTimer = Timer.periodic(const Duration(milliseconds: 50), (_) => _flushPending());
+  }
+
+  /// Drain the pending-frames buffer in a single setState (one render per 50 ms).
+  void _flushPending() {
+    if (!mounted) return;
+
+    final now = DateTime.now();
+    _recentFrameTimes.removeWhere(
+      (timestamp) => now.difference(timestamp) > const Duration(seconds: 1),
+    );
+    final nextFps = _recentFrameTimes.length.toDouble();
+
+    // Frame-timeout check: only for hardware BLE source while streaming
+    if (_source.statsStream != null && _sourceState == SourceState.streaming) {
+      final silent = _lastFrameAt != null &&
+          now.difference(_lastFrameAt!) > _frameTimeoutDuration;
+      if (silent != _busIsSilent) setState(() => _busIsSilent = silent);
+    }
+
+    if (_pendingFrames.isEmpty) {
+      if (_framesPerSecond != nextFps) {
+        setState(() => _framesPerSecond = nextFps);
+      }
+      _updateHealthReport();
+      _updateAnomalyReport();
+      return;
+    }
+    final batch = List<CanFrame>.of(_pendingFrames);
+    _pendingFrames.clear();
+
+    final prevTotal = _totalFrames;
+
+    _lastFrameAt = DateTime.now();
+    _recentFrameTimes.addAll(batch.map((frame) => frame.timestamp));
+    _recentFrameTimes.removeWhere(
+      (timestamp) => now.difference(timestamp) > const Duration(seconds: 1),
+    );
+    _framesPerSecond = _recentFrameTimes.length.toDouble();
+    if (_busIsSilent) setState(() => _busIsSilent = false);
+
+    setState(() {
+      for (final frame in batch) {
         _totalFrames++;
-        
-        // Use stored errors from frame instead of re-analyzing
+
         final storedErrors = _getStoredErrors(frame);
-        bool hasAnyError = frame.isCorrupted || storedErrors.isNotEmpty;
-        
+        final hasAnyError = frame.isCorrupted || storedErrors.isNotEmpty;
+        if (hasAnyError) _errorFrames++;
+
         if (hasAnyError) {
-          _errorFrames++;
+          _recordSourceEvent(
+            type: CanSessionEventType.errorDetected,
+            message: 'Error detected in frame 0x${frame.id.toRadixString(16).toUpperCase()}',
+            data: {
+              'frameId': frame.id,
+              'frameHexId': frame.idHex,
+              'status': frame.status,
+              'timestamp': frame.timestamp.toIso8601String(),
+              'corrupted': frame.isCorrupted,
+              'isRtr': frame.isRtr,
+              'isExtended': frame.isExtended,
+              'dataLength': frame.dlc,
+              'dataHex': frame.dataHex,
+              'errorTypes': storedErrors.map((error) => error.type.name).toList(),
+              'errorOrigins': storedErrors.map((error) => error.origin.name).toList(),
+              'errorDescriptions': storedErrors.map((error) => error.description).toList(),
+              'errorSeverities': storedErrors.map((error) => error.severity).toList(),
+              'maxSeverity': storedErrors.isNotEmpty
+                  ? storedErrors.map((error) => error.severity).reduce((a, b) => a > b ? a : b)
+                  : (frame.isCorrupted ? 3 : 0),
+            },
+          );
         }
-        
-        // Update error statistics
+
         if (frame.isCorrupted) {
-          _errorStats[CanErrorType.crcError] = (_errorStats[CanErrorType.crcError] ?? 0) + 1;
+          _errorStats[CanErrorType.crcError] =
+              (_errorStats[CanErrorType.crcError] ?? 0) + 1;
         }
-        
-        // Count additional error types from stored errors
         for (final error in storedErrors) {
           _errorStats[error.type] = (_errorStats[error.type] ?? 0) + 1;
         }
-        
-        // Add frame to the beginning of the list
+
         _frames.insert(0, frame);
-        
-        // Keep only the most recent frames
-        if (_frames.length > _maxFramesToShow) {
-          _frames.removeRange(_maxFramesToShow, _frames.length);
-        }
-        
-        // Update error rate history for chart
-        if (_totalFrames > 0) {
-          final currentErrorRate = (_errorFrames / _totalFrames) * 100;
-          _errorRateHistory.add(currentErrorRate);
-          
-          // Keep only recent history points
-          if (_errorRateHistory.length > _maxHistoryPoints) {
-            _errorRateHistory.removeAt(0);
-          }
-        }
-        
-        // Update current session periodically (every 10 frames)
-        if (_totalFrames % 10 == 0) {
-          _sessionService.updateCurrentSession(
-            frames: _frames,
-            errorStats: _errorStats,
-            totalFrames: _totalFrames,
-            errorFrames: _errorFrames,
-            errorRate: _errorRate,
-          );
-        }
-      });
+      }
+
+      if (_frames.length > _maxFramesToShow) {
+        _frames.removeRange(_maxFramesToShow, _frames.length);
+      }
+
+      // Chart: simulator mode only — hardware mode feeds chart from TWAI stats delta
+      if (_source.statsStream == null && _totalFrames > 0) {
+        final rate = (_errorFrames / _totalFrames) * 100;
+        _errorRateHistory.add(rate);
+        if (_errorRateHistory.length > _maxHistoryPoints) _errorRateHistory.removeAt(0);
+      }
     });
+
+    // Session update every 50 frames (was every 10, but batching makes finer
+    // granularity irrelevant — 50 frames ≈ 2.5 s at simulator rate)
+    if (_totalFrames > 0 && _totalFrames ~/ 50 != prevTotal ~/ 50) {
+      _sessionService.updateCurrentSession(
+        frames: _frames,
+        errorStats: _errorStats,
+        totalFrames: _totalFrames,
+        errorFrames: _errorFrames,
+        errorRate: _errorRate,
+      );
+    }
+
+    _recordSourceEvent(
+      type: CanSessionEventType.frameBatch,
+      message: 'Processed frame batch of ${batch.length} frames from ${_source.name}',
+      data: {
+        'batchSize': batch.length,
+        'totalFrames': _totalFrames,
+        'errorFrames': _errorFrames,
+        'batchErrorFrames': batch.where((frame) => frame.isCorrupted || _getStoredErrors(frame).isNotEmpty).length,
+        'sourceState': _sourceState?.name,
+        'batchStartTimestamp': batch.isNotEmpty ? batch.first.timestamp.toIso8601String() : null,
+        'batchEndTimestamp': batch.isNotEmpty ? batch.last.timestamp.toIso8601String() : null,
+        'containsCorruptedFrames': batch.any((frame) => frame.isCorrupted),
+        'containsAnalyzedErrors': batch.any((frame) => _getStoredErrors(frame).isNotEmpty),
+      },
+    );
+    _updateHealthReport();
+    _updateAnomalyReport();
+  }
+
+  void _updateHealthReport() {
+    final report = _healthAnalyzer.analyze(
+      latestStats: _latestStats,
+      errorRate: _errorRate,
+      errorDetectedEvents: _errorFrames,
+      reconnectCount: _reconnectCount,
+      busIsSilent: _busIsSilent,
+    );
+    _recordNewHealthFindings(report);
+    if (mounted &&
+      (report.score != _healthReport.score ||
+        report.severity != _healthReport.severity ||
+        report.findings.length != _healthReport.findings.length)) {
+      setState(() => _healthReport = report);
+    }
+  }
+
+  void _recordNewHealthFindings(CanHealthReport report) {
+    final previousTitles = _healthReport.findings.map((finding) => finding.title).toSet();
+    for (final finding in report.findings) {
+      if (previousTitles.contains(finding.title)) continue;
+
+      _sessionService.recordSessionEvent(
+        CanSessionEvent.create(
+          type: CanSessionEventType.diagnostic,
+          message: finding.title,
+          sourceName: _source.name,
+          diagnosticSeverity: _diagnosticSeverityFor(finding.severity),
+          diagnosticCause: _diagnosticCauseFor(finding.title),
+          explanation: finding.explanation,
+          recommendation: finding.recommendation,
+          data: {
+            'healthScore': report.score,
+            'sourceState': _sourceState?.name,
+            'reconnectCount': _reconnectCount,
+          },
+        ),
+      );
+    }
+  }
+
+  void _updateAnomalyReport() {
+    final session = _sessionService.currentSession;
+    final anomalies = _anomalyAnalyzer.analyze(
+      frames: _frames,
+      statsSnapshots: session?.statsSnapshots ?? const [],
+      events: session?.events ?? const [],
+    );
+    final previousTitles = _anomalies.map((anomaly) => anomaly.title).toSet();
+    for (final anomaly in anomalies) {
+      if (previousTitles.contains(anomaly.title)) continue;
+      _sessionService.recordSessionEvent(
+        CanSessionEvent.create(
+          type: CanSessionEventType.diagnostic,
+          message: anomaly.title,
+          sourceName: _source.name,
+          diagnosticSeverity: _diagnosticSeverityFor(anomaly.severity),
+          diagnosticCause: _diagnosticCauseForAnomaly(anomaly.type),
+          explanation: anomaly.explanation,
+          recommendation: anomaly.recommendation,
+          data: {
+            'confidence': anomaly.confidence,
+            'anomalyType': anomaly.type.name,
+            'sourceState': _sourceState?.name,
+          },
+        ),
+      );
+    }
+    if (mounted) setState(() => _anomalies = anomalies);
+  }
+
+  DiagnosticCause _diagnosticCauseForAnomaly(CanAnomalyType type) {
+    switch (type) {
+      case CanAnomalyType.packetLoss:
+        return DiagnosticCause.rxOverflow;
+      case CanAnomalyType.arbitrationLost:
+        return DiagnosticCause.arbitrationLost;
+      case CanAnomalyType.silentPeriod:
+        return DiagnosticCause.silentBus;
+      case CanAnomalyType.reconnectStorm:
+        return DiagnosticCause.bleLoss;
+      case CanAnomalyType.counterSpike:
+      case CanAnomalyType.repeatedError:
+      case CanAnomalyType.burstTraffic:
+      case CanAnomalyType.unstableRecovery:
+        return DiagnosticCause.busNoise;
+    }
+  }
+
+  DiagnosticSeverity _diagnosticSeverityFor(SessionSeverity severity) {
+    switch (severity) {
+      case SessionSeverity.normal:
+      case SessionSeverity.low:
+        return DiagnosticSeverity.info;
+      case SessionSeverity.medium:
+        return DiagnosticSeverity.warning;
+      case SessionSeverity.high:
+        return DiagnosticSeverity.error;
+      case SessionSeverity.critical:
+        return DiagnosticSeverity.critical;
+    }
+  }
+
+  DiagnosticCause _diagnosticCauseFor(String title) {
+    switch (title) {
+      case 'Silent CAN bus':
+        return DiagnosticCause.silentBus;
+      case 'Bus-off':
+      case 'Bus recovery in progress':
+        return DiagnosticCause.busOff;
+      case 'Error passive':
+      case 'Error warning':
+      case 'High frame error rate':
+        return DiagnosticCause.busNoise;
+      case 'RX overflow':
+        return DiagnosticCause.rxOverflow;
+      case 'Reconnect storm':
+        return DiagnosticCause.bleLoss;
+      default:
+        return DiagnosticCause.unknown;
+    }
   }
 
   /// Start the CAN frame simulation
@@ -119,19 +488,42 @@ class _MonitorScreenState extends State<MonitorScreen> {
     });
     
     // Create new session
-    await _sessionService.createSession();
-    _simulator.start();
+    await _sessionService.createSession(sourceName: _source.name);
+    _recordSourceEvent(
+      type: CanSessionEventType.sourceStarted,
+      message: 'Monitoring started from ${_source.name}',
+      data: {
+        'frameBufferLimit': _maxFramesToShow,
+        'historyLimit': _maxHistoryPoints,
+      },
+    );
+    await _source.start();
   }
 
   /// Stop the CAN frame simulation
-  void _stopSimulation() async {
+  Future<void> _stopSimulation() async {
     setState(() {
       _isRunning = false;
     });
-    _simulator.stop();
+    await _source.stop();
+    _recordSourceEvent(
+      type: CanSessionEventType.sourceStopped,
+      message: 'Monitoring stopped for ${_source.name}',
+      data: {
+        'totalFrames': _totalFrames,
+        'errorFrames': _errorFrames,
+        'errorRate': _errorRate,
+        'recentFramesStored': _frames.length,
+        'lastFrameTime': _lastFrameAt?.toIso8601String(),
+        'framesPerSecond': _framesPerSecond,
+        'lastFrameAgeMs': _lastFrameAt == null ? null : DateTime.now().difference(_lastFrameAt!).inMilliseconds,
+        'reconnectCount': _reconnectCount,
+      },
+    );
     
     // Save current session
     _sessionService.updateCurrentSession(
+      sourceName: _source.name,
       frames: _frames,
       errorStats: _errorStats,
       totalFrames: _totalFrames,
@@ -143,11 +535,10 @@ class _MonitorScreenState extends State<MonitorScreen> {
 
   /// Reset all counters and clear frames
   void _resetSimulation() async {
-    _simulator.reset();
-    
     // Save current session if it exists
     if (_isRunning) {
       _sessionService.updateCurrentSession(
+        sourceName: _source.name,
         frames: _frames,
         errorStats: _errorStats,
         totalFrames: _totalFrames,
@@ -156,13 +547,19 @@ class _MonitorScreenState extends State<MonitorScreen> {
       );
       await _sessionService.completeCurrentSession();
     }
-    
+
+    _uiTimer?.cancel();
+    _pendingFrames.clear();
+    await _subscription.cancel();
+    await _source.stop();
+    _setupFrameListener();
+
     setState(() {
       _frames.clear();
       _totalFrames = 0;
       _errorFrames = 0;
       _isRunning = false;
-      
+
       // Reset error statistics
       for (var type in CanErrorType.values) {
         _errorStats[type] = 0;
@@ -170,6 +567,15 @@ class _MonitorScreenState extends State<MonitorScreen> {
       
       // Clear error rate history
       _errorRateHistory.clear();
+      _recentFrameTimes.clear();
+      _framesPerSecond = 0.0;
+      _reconnectCount = 0;
+      _healthReport = const CanHealthReport(
+        score: 100,
+        severity: SessionSeverity.normal,
+        findings: [],
+      );
+      _anomalies = const [];
     });
   }
 
@@ -180,7 +586,59 @@ class _MonitorScreenState extends State<MonitorScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        if (!_isRunning) {
+          _sessionService.updateCurrentSession(
+            sourceName: _source.name,
+            frames: _frames,
+            errorStats: _errorStats,
+            totalFrames: _totalFrames,
+            errorFrames: _errorFrames,
+            errorRate: _errorRate,
+          );
+          await _sessionService.completeCurrentSession();
+          if (context.mounted) Navigator.of(context).pop();
+          return;
+        }
+
+        final choice = await showDialog<String>(
+          context: context,
+          builder: (context) {
+            return AlertDialog(
+              backgroundColor: AppTheme.darkSurface,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+                side: BorderSide(color: AppTheme.primaryOrange.withValues(alpha: 0.3)),
+              ),
+              title: Text('Simulation running', style: TextStyle(color: AppTheme.textPrimary)),
+              content: Text('A simulation is still running. What would you like to do?', style: TextStyle(color: AppTheme.textSecondary)),
+              actions: [
+                TextButton(onPressed: () => Navigator.of(context).pop('cancel'), child: const Text('Cancel')),
+                TextButton(onPressed: () => Navigator.of(context).pop('leave'), child: const Text('Leave without saving')),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primaryAmber),
+                  onPressed: () => Navigator.of(context).pop('stop_save'),
+                  child: const Text('Stop & Save'),
+                ),
+              ],
+            );
+          },
+        );
+
+        if (!context.mounted) return;
+        if (choice == 'stop_save') {
+          await _stopSimulation();
+          if (context.mounted) Navigator.of(context).pop();
+        } else if (choice == 'leave') {
+          await _source.stop();
+          _sessionService.discardCurrentSession();
+          if (context.mounted) Navigator.of(context).pop();
+        }
+      },
+      child: Scaffold(
       backgroundColor: AppTheme.darkBackground,
       appBar: AppBar(
         title: Row(
@@ -207,7 +665,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
         actions: [
           AnimatedIconButton(
             icon: _isRunning ? Icons.pause_circle_filled : Icons.play_circle_filled,
-            onPressed: _isRunning ? _stopSimulation : _startSimulation,
+            onPressed: _isRunning ? () => _stopSimulation() : _startSimulation,
             tooltip: _isRunning ? 'Pause' : 'Start',
             color: _isRunning ? AppTheme.primaryAmber : AppTheme.accentGreen,
           ).animate().scale(duration: 200.ms),
@@ -228,9 +686,18 @@ class _MonitorScreenState extends State<MonitorScreen> {
       ),
       body: Column(
         children: [
+          // BLE connection state banner (hidden for simulator)
+          if (_source.statsStream != null) _buildConnectionBanner(),
+
+          // Bus-off / error-passive / silent alert (BLE only)
+          if (_latestStats != null || _busIsSilent) _buildBusOffBanner(),
+
+          // TWAI hardware counters row (BLE only)
+          if (_latestStats != null) _buildHardwareStatsPanel(),
+
           // Statistics Panel
           _buildStatisticsPanel(),
-          
+
           // Frame List Header
           _buildFrameListHeader(),
           
@@ -248,10 +715,10 @@ class _MonitorScreenState extends State<MonitorScreen> {
             decoration: BoxDecoration(
               gradient: AppTheme.backgroundGradient,
               borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: AppTheme.primaryAmber.withOpacity(0.3)),
+              border: Border.all(color: AppTheme.primaryAmber.withValues(alpha: 0.3)),
               boxShadow: [
                 BoxShadow(
-                  color: AppTheme.primaryAmber.withOpacity(0.1),
+                  color: AppTheme.primaryAmber.withValues(alpha: 0.1),
                   blurRadius: 8,
                   spreadRadius: 2,
                 ),
@@ -259,6 +726,431 @@ class _MonitorScreenState extends State<MonitorScreen> {
             ),
             child: _buildErrorRateChart(),
           ).animate(delay: 1200.ms).fadeIn().slideY(begin: 0.3, end: 0),
+        ],
+      ),
+      )
+    );
+  }
+
+  /// Alert banner for hardware bus anomalies: BUS_OFF, RECOVERING, Error Passive, or silent bus.
+  Widget _buildBusOffBanner() {
+    final stats = _latestStats;
+
+    // Stats not arrived yet but bus already went silent (e.g., BLE connected, wire pulled immediately)
+    if (stats == null) {
+      if (!_busIsSilent) return const SizedBox.shrink();
+      return _alertBanner(
+        Icons.cable_outlined,
+        'CAN bus silent — no frames for 3 s. Wire disconnected or SENDER off?',
+        AppTheme.primaryOrange,
+        null,
+      );
+    }
+
+    // Priority order: BUS_OFF > RECOVERING > silent bus > error passive
+    final String? label;
+    final Color color;
+    final IconData icon;
+
+    if (stats.isBusOff) {
+      label = 'BUS-OFF — TX error limit reached (TEC > 255). Recovery in progress…';
+      color = AppTheme.accentRed;
+      icon  = Icons.dangerous_outlined;
+    } else if (stats.isRecovering) {
+      label = 'Recovering from bus-off…';
+      color = AppTheme.primaryAmber;
+      icon  = Icons.autorenew;
+    } else if (_busIsSilent) {
+      label = 'CAN bus silent — no frames for 3 s. Wire disconnected or SENDER off?';
+      color = AppTheme.primaryOrange;
+      icon  = Icons.cable_outlined;
+    } else if (stats.isErrorPassive) {
+      // TEC or REC > 127: node entered error-passive per CAN spec (ISO 11898-1 §6.15)
+      label = 'Error Passive — TEC ${stats.txErrorCounter} / REC ${stats.rxErrorCounter} > 127. Approaching bus-off.';
+      color = AppTheme.primaryAmber;
+      icon  = Icons.warning_amber_rounded;
+    } else if (stats.isErrorWarning) {
+      // TEC or REC 96–127: Error Warning level — still error-active but degraded
+      label = 'Error Warning — TEC ${stats.txErrorCounter} / REC ${stats.rxErrorCounter} > 96. Monitor bus quality.';
+      color = Colors.yellow.shade700;
+      icon  = Icons.report_problem_outlined;
+    } else {
+      return const SizedBox.shrink();
+    }
+
+    return _alertBanner(icon, label, color, stats.isRunning ? stats : null);
+  }
+
+  Widget _alertBanner(IconData icon, String label, Color color, CanStats? counters) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      color: color.withValues(alpha: 0.18),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(label, style: TextStyle(color: color, fontSize: 13, fontWeight: FontWeight.w600)),
+          ),
+          if (counters != null)
+            Text('TEC: ${counters.txErrorCounter}  REC: ${counters.rxErrorCounter}',
+                style: TextStyle(color: color.withValues(alpha: 0.8), fontSize: 11)),
+        ],
+      ),
+    );
+  }
+
+  /// Synthetic frame emitted into the frame list when TWAI reports bus errors.
+  /// ID 0x000 is not used by any real MODE 1 signal, so it acts as a visual marker.
+  /// Heuristic error type classification by TEC/REC delta behavior:
+  ///   tecDelta>0, recDelta==0 → RECEIVER sent error flags → ACK/bit error
+  ///   recDelta>0, tecDelta==0 → receive-only errors → CRC/form/stuff error
+  ///   both > 0                → active error (both sides involved)
+  CanFrame _makeTwaiErrorFrame(CanStats stats, int errorDelta, int tecDelta, int recDelta) {
+    final CanErrorType type;
+    final String hint;
+
+    if (stats.isBusOff) {
+      type = CanErrorType.busOffError;
+      hint = 'TEC > 255 → BUS-OFF';
+    } else if (stats.isErrorPassive) {
+      type = CanErrorType.passiveError;
+      hint = 'error-passive (TEC/REC > 127)';
+    } else if (tecDelta > 0 && recDelta == 0) {
+      type = CanErrorType.ackError;
+      hint = 'TEC↑$tecDelta — ACK/bit error (no ACK or bit error on TX)';
+    } else if (recDelta > 0 && tecDelta == 0) {
+      type = CanErrorType.crcError;
+      hint = 'REC↑$recDelta — CRC/form/stuff error in received frame';
+    } else if (tecDelta > 0 && recDelta > 0) {
+      type = CanErrorType.activeError;
+      hint = 'TEC↑$tecDelta REC↑$recDelta — active error flag exchange';
+    } else {
+      type = CanErrorType.activeError;
+      hint = 'bus error detected';
+    }
+
+    final severity = stats.isBusOff ? 5 : stats.isErrorPassive ? 4 : 3;
+
+    return CanFrame.create(
+      id: 0x000,
+      dlc: 0,
+      data: [],
+      timestamp: DateTime.now(),
+      isCorrupted: false,
+      errors: [
+        CanErrorInfo(
+          type: type,
+          description:
+              'TWAI: +$errorDelta err | $hint | '
+              'TEC ${stats.txErrorCounter} REC ${stats.rxErrorCounter} | '
+              '${stats.busState}',
+          severity: severity,
+          origin: CanErrorOrigin.inferred,
+        ),
+      ],
+    );
+  }
+
+  /// Synthetic frame for arbitration-lost events (multiple senders competing).
+  CanFrame _makeArbLostFrame(CanStats stats, int arbDelta) {
+    return CanFrame.create(
+      id: 0x000,
+      dlc: 0,
+      data: [],
+      timestamp: DateTime.now(),
+      isCorrupted: false,
+      errors: [
+        CanErrorInfo(
+          type: CanErrorType.formError,
+          description: 'TWAI: arbitration lost ×$arbDelta — multiple nodes transmitting simultaneously?',
+          severity: 2,
+          origin: CanErrorOrigin.hardware,
+        ),
+      ],
+    );
+  }
+
+  /// Error Warning level: TEC or REC crossed 96, node approaching error-passive.
+  /// Injected once on the transition — acts as a timestamped event in the frame list.
+  CanFrame _makeErrorWarningFrame(CanStats stats) {
+    return CanFrame.create(
+      id: 0x000, dlc: 0, data: [],
+      timestamp: DateTime.now(),
+      isCorrupted: false,
+      errors: [
+        CanErrorInfo(
+          type: CanErrorType.activeError,
+          description: 'Error Warning: TEC ${stats.txErrorCounter} / '
+              'REC ${stats.rxErrorCounter} exceeded 96 — '
+              'approaching error-passive threshold (127)',
+          severity: 2,
+          origin: CanErrorOrigin.hardware,
+        ),
+      ],
+    );
+  }
+
+  /// Speed mismatch: SENDER at 250 kbps, RECEIVER at 500 kbps.
+  /// Wrong bit timing causes >5 consecutive same-polarity bits at unexpected positions.
+  CanFrame _makeStuffingErrorFrame(CanStats stats, int errorDelta) {
+    return CanFrame.create(
+      id: 0x000, dlc: 0, data: [],
+      timestamp: DateTime.now(),
+      isCorrupted: false,
+      errors: [
+        CanErrorInfo(
+          type: CanErrorType.stuffingError,
+          description: 'Speed mismatch: bit stuffing violation — '
+              'SENDER 250k ≠ RECEIVER 500k | '
+              '+$errorDelta err | REC ${stats.rxErrorCounter}',
+          severity: 3,
+          origin: CanErrorOrigin.inferred,
+        ),
+      ],
+    );
+  }
+
+  /// Speed mismatch: wrong bit timing corrupts fixed-format fields (EOF, delimiters).
+  CanFrame _makeFormatErrorFrame(CanStats stats, int errorDelta) {
+    return CanFrame.create(
+      id: 0x000, dlc: 0, data: [],
+      timestamp: DateTime.now(),
+      isCorrupted: false,
+      errors: [
+        CanErrorInfo(
+          type: CanErrorType.formatError,
+          description: 'Speed mismatch: frame format error — '
+              'EOF/delimiter bits at wrong positions | '
+              'SENDER 250k ≠ RECEIVER 500k | REC ${stats.rxErrorCounter}',
+          severity: 3,
+          origin: CanErrorOrigin.inferred,
+        ),
+      ],
+    );
+  }
+
+  /// No-ACK mode: RECEIVER firmware compiled with NO_ACK_MODE=1, so it never
+  /// sends ACK bits. Every bus error is therefore an ACK error on the SENDER side.
+  CanFrame _makeNoAckErrorFrame(CanStats stats, int errorDelta) {
+    return CanFrame.create(
+      id: 0x000,
+      dlc: 0,
+      data: [],
+      timestamp: DateTime.now(),
+      isCorrupted: false,
+      errors: [
+        CanErrorInfo(
+          type: CanErrorType.ackError,
+          description: 'No-ACK mode: RECEIVER not sending ACK bits — '
+              'SENDER TEC↑ (currently ${stats.txErrorCounter}) | '
+              '+$errorDelta bus err | ${stats.busState}',
+          severity: 4,
+          origin: CanErrorOrigin.hardware,
+        ),
+      ],
+    );
+  }
+
+  /// Exact ACK/TX failure — tx_failed_count incremented by TWAI when a queued
+  /// TX message was aborted (TEC exceeded limit). Definitive ACK error signal.
+  CanFrame _makeTxFailFrame(CanStats stats, int txFailDelta) {
+    return CanFrame.create(
+      id: 0x000,
+      dlc: 0,
+      data: [],
+      timestamp: DateTime.now(),
+      isCorrupted: false,
+      errors: [
+        CanErrorInfo(
+          type: CanErrorType.ackError,
+          description: 'TWAI: TX failed ×$txFailDelta — '
+              'no ACK received (receiver absent or dominant bit error) | '
+              'TEC ${stats.txErrorCounter}',
+          severity: 4,
+          origin: CanErrorOrigin.hardware,
+        ),
+      ],
+    );
+  }
+
+  /// Software RX queue overflow — rx_missed_count incremented by TWAI driver when
+  /// its software queue (default 5 slots) is full and an incoming frame is dropped.
+  /// More commonly triggered by MODE 2 burst than the hardware-level rx_overrun.
+  CanFrame _makeMissedFrame(CanStats stats, int missedDelta) {
+    return CanFrame.create(
+      id: 0x000,
+      dlc: 0,
+      data: [],
+      timestamp: DateTime.now(),
+      isCorrupted: false,
+      errors: [
+        CanErrorInfo(
+          type: CanErrorType.overloadError,
+          description: 'TWAI: RX queue overflow — $missedDelta frame(s) dropped '
+              '(bus rate > processing rate) | total missed: ${stats.rxMissed}',
+          severity: 3,
+            origin: CanErrorOrigin.hardware,
+        ),
+      ],
+    );
+  }
+
+  /// Hardware RX overrun — rx_overrun_count incremented when TWAI RX buffer
+  /// was full at the hardware level and an incoming frame was dropped.
+  CanFrame _makeOverrunFrame(CanStats stats, int ovrDelta) {
+    return CanFrame.create(
+      id: 0x000,
+      dlc: 0,
+      data: [],
+      timestamp: DateTime.now(),
+      isCorrupted: false,
+      errors: [
+        CanErrorInfo(
+          type: CanErrorType.overloadError,
+          description: 'TWAI: HW RX overrun ×$ovrDelta — '
+              'frame(s) dropped at hardware level (bus rate > processing rate) | '
+              'missed ${stats.rxMissed}',
+          severity: 3,
+            origin: CanErrorOrigin.hardware,
+        ),
+      ],
+    );
+  }
+
+  /// Compact TWAI hardware counters row — visible only for real BLE source.
+  Widget _buildHardwareStatsPanel() {
+    final stats = _latestStats;
+    if (stats == null) return const SizedBox.shrink();
+
+    final stateColor = stats.isBusOff
+        ? AppTheme.accentRed
+        : stats.isRecovering
+            ? AppTheme.primaryAmber
+            : AppTheme.accentGreen;
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: AppTheme.darkSurface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: stateColor.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        children: [
+          // Bus state chip
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            decoration: BoxDecoration(
+              color: stateColor.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: stateColor.withValues(alpha: 0.4)),
+            ),
+            child: Text(
+              stats.busState,
+              style: TextStyle(color: stateColor, fontSize: 11, fontWeight: FontWeight.bold),
+            ),
+          ),
+          const SizedBox(width: 12),
+          _hwStat('TEC', stats.txErrorCounter, stats.txErrorCounter > 127 ? AppTheme.accentRed : AppTheme.textSecondary),
+          const SizedBox(width: 12),
+          _hwStat('REC', stats.rxErrorCounter, stats.rxErrorCounter > 127 ? AppTheme.accentRed : AppTheme.textSecondary),
+          const SizedBox(width: 12),
+          _hwStat('RX', stats.rxTotal, AppTheme.primaryAmber),
+          const SizedBox(width: 12),
+          _hwStat('MISS', stats.rxMissed, stats.rxMissed > 0 ? AppTheme.primaryOrange : AppTheme.textMuted),
+          if (stats.isNoAckMode) ...[
+            const SizedBox(width: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: AppTheme.accentRed.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: AppTheme.accentRed.withValues(alpha: 0.5)),
+              ),
+              child: const Text('NO-ACK', style: TextStyle(color: AppTheme.accentRed, fontSize: 10, fontWeight: FontWeight.bold)),
+            ),
+          ],
+          if (stats.isSpeedMismatchDemo) ...[
+            const SizedBox(width: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: AppTheme.primaryAmber.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: AppTheme.primaryAmber.withValues(alpha: 0.5)),
+              ),
+              child: const Text('250k≠500k', style: TextStyle(color: AppTheme.primaryAmber, fontSize: 10, fontWeight: FontWeight.bold)),
+            ),
+          ],
+          const Spacer(),
+          Text(
+            'TWAI ${_formatTime(stats.timestamp)}',
+            style: const TextStyle(color: AppTheme.textMuted, fontSize: 10),
+          ),
+          if (stats.reasonCode != null) ...[
+            const SizedBox(width: 8),
+            Text(
+              stats.reasonCode!,
+              style: const TextStyle(color: AppTheme.textSecondary, fontSize: 10),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _hwStat(String label, int value, Color color) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('$value', style: TextStyle(color: color, fontSize: 13, fontWeight: FontWeight.w600)),
+        Text(label, style: const TextStyle(color: AppTheme.textMuted, fontSize: 10)),
+      ],
+    );
+  }
+
+  String _formatTime(DateTime dt) =>
+      '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
+
+  Widget _buildConnectionBanner() {
+    final state = _sourceState;
+    if (state == null || state == SourceState.idle) return const SizedBox.shrink();
+
+    final (label, color, showSpinner) = switch (state) {
+      SourceState.connecting    => ('Connecting to ESP32…',          AppTheme.primaryOrange, true),
+      SourceState.scanning      => ('Scanning for ESP32 CAN Stand…', AppTheme.primaryOrange, true),
+      SourceState.connected     => ('Connected — subscribing…',      AppTheme.primaryAmber,  true),
+      SourceState.streaming     => ('Streaming from ESP32 CAN Stand', AppTheme.accentGreen,  false),
+      SourceState.reconnecting  => ('Reconnecting to ESP32…',         AppTheme.primaryOrange, true),
+      SourceState.disconnected  => ('Disconnected — reconnecting…',  AppTheme.accentRed,    true),
+      SourceState.lost          => ('CAN Stand not found',             AppTheme.accentRed,    false),
+      SourceState.error         => ('Connection error — retrying…',  AppTheme.accentRed,    true),
+      SourceState.idle          => ('', AppTheme.textMuted, false),
+    };
+
+    if (label.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: color.withValues(alpha: 0.12),
+      child: Row(
+        children: [
+          if (showSpinner)
+            SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(strokeWidth: 2, color: color),
+            )
+          else
+            Icon(Icons.circle, size: 10, color: color),
+          const SizedBox(width: 10),
+          Text(label, style: TextStyle(color: color, fontSize: 13)),
+          const Spacer(),
+          Text(_source.name, style: const TextStyle(color: AppTheme.textMuted, fontSize: 11)),
         ],
       ),
     );
@@ -274,7 +1166,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
-            color: AppTheme.primaryOrange.withOpacity(0.1),
+            color: AppTheme.primaryOrange.withValues(alpha: 0.1),
             blurRadius: 10,
             spreadRadius: 2,
           ),
@@ -313,11 +1205,68 @@ class _MonitorScreenState extends State<MonitorScreen> {
                 _isRunning ? Icons.play_circle_filled : Icons.pause_circle_filled,
                 _isRunning ? AppTheme.accentGreen : AppTheme.textMuted,
               ).animate(delay: 400.ms).fadeIn().scale(begin: const Offset(0.8, 0.8)),
+              const SizedBox(width: 8),
+              _buildStatCard(
+                'Frame Rate',
+                '${_framesPerSecond.toStringAsFixed(1)} /s',
+                Icons.speed,
+                AppTheme.accentGreen,
+              ).animate(delay: 500.ms).fadeIn().scale(begin: const Offset(0.8, 0.8)),
+              const SizedBox(width: 8),
+              _buildStatCard(
+                'Reconnects',
+                _reconnectCount.toString(),
+                Icons.sync,
+                AppTheme.primaryOrange,
+              ).animate(delay: 600.ms).fadeIn().scale(begin: const Offset(0.8, 0.8)),
+              const SizedBox(width: 8),
+              _buildStatCard(
+                'Last Frame',
+                _formatFrameAge(),
+                Icons.access_time,
+                AppTheme.primaryAmber,
+              ).animate(delay: 700.ms).fadeIn().scale(begin: const Offset(0.8, 0.8)),
+              const SizedBox(width: 8),
+              _buildStatCard(
+                'Health',
+                '${_healthReport.score}/100',
+                Icons.health_and_safety,
+                _healthColor(_healthReport.severity),
+              ).animate(delay: 800.ms).fadeIn().scale(begin: const Offset(0.8, 0.8)),
+              const SizedBox(width: 8),
+              _buildStatCard(
+                'Anomalies',
+                _anomalies.length.toString(),
+                Icons.insights,
+                _anomalies.isEmpty ? AppTheme.accentGreen : AppTheme.primaryOrange,
+              ).animate(delay: 900.ms).fadeIn().scale(begin: const Offset(0.8, 0.8)),
             ],
           ),
         ),
       ),
     );
+  }
+
+  String _formatFrameAge() {
+    final lastFrame = _lastFrameAt;
+    if (lastFrame == null) return 'n/a';
+    final age = DateTime.now().difference(lastFrame);
+    if (age.inSeconds > 0) return '${age.inSeconds}s ago';
+    return '${age.inMilliseconds}ms';
+  }
+
+  Color _healthColor(SessionSeverity severity) {
+    switch (severity) {
+      case SessionSeverity.normal:
+        return AppTheme.accentGreen;
+      case SessionSeverity.low:
+        return AppTheme.primaryAmber;
+      case SessionSeverity.medium:
+        return AppTheme.primaryOrange;
+      case SessionSeverity.high:
+      case SessionSeverity.critical:
+        return AppTheme.accentRed;
+    }
   }
 
   /// Build individual statistic card
@@ -332,9 +1281,9 @@ class _MonitorScreenState extends State<MonitorScreen> {
             Container(
               padding: const EdgeInsets.all(6),
               decoration: BoxDecoration(
-                color: color.withOpacity(0.1),
+                color: color.withValues(alpha: 0.1),
                 shape: BoxShape.circle,
-                border: Border.all(color: color.withOpacity(0.3)),
+                border: Border.all(color: color.withValues(alpha: 0.3)),
               ),
               child: Icon(icon, color: color, size: 16),
             ),
@@ -381,7 +1330,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
           topLeft: Radius.circular(12),
           topRight: Radius.circular(12),
         ),
-        border: Border.all(color: AppTheme.primaryOrange.withOpacity(0.3)),
+        border: Border.all(color: AppTheme.primaryOrange.withValues(alpha: 0.3)),
       ),
       child: Row(
         children: [
@@ -466,7 +1415,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
             bottomLeft: Radius.circular(12),
             bottomRight: Radius.circular(12),
           ),
-          border: Border.all(color: AppTheme.primaryOrange.withOpacity(0.3)),
+          border: Border.all(color: AppTheme.primaryOrange.withValues(alpha: 0.3)),
         ),
         child: Center(
           child: Padding(
@@ -524,7 +1473,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
           bottomLeft: Radius.circular(12),
           bottomRight: Radius.circular(12),
         ),
-        border: Border.all(color: AppTheme.primaryOrange.withOpacity(0.3)),
+        border: Border.all(color: AppTheme.primaryOrange.withValues(alpha: 0.3)),
       ),
       child: ListView.builder(
         itemCount: _frames.length,
@@ -553,11 +1502,26 @@ class _MonitorScreenState extends State<MonitorScreen> {
   Widget _buildFrameRow(CanFrame frame, int index) {
     final errors = _getStoredErrors(frame);
     final hasAnyError = frame.isCorrupted || errors.isNotEmpty;
-    final backgroundColor = hasAnyError 
-        ? AppTheme.accentRed.withOpacity(0.1)
-        : (index % 2 == 0 ? AppTheme.darkContainer.withOpacity(0.3) : Colors.transparent);
-    
-    final textColor = hasAnyError ? AppTheme.accentRed : AppTheme.textPrimary;
+    final isRtr = frame.isRtr;
+    final isExt = frame.isExtended;
+
+    final Color backgroundColor;
+    final Color textColor;
+    if (hasAnyError) {
+      backgroundColor = AppTheme.accentRed.withValues(alpha: 0.1);
+      textColor = AppTheme.accentRed;
+    } else if (isRtr) {
+      backgroundColor = AppTheme.primaryAmber.withValues(alpha: 0.08);
+      textColor = AppTheme.primaryAmber;
+    } else if (isExt) {
+      backgroundColor = AppTheme.accentGreen.withValues(alpha: 0.06);
+      textColor = AppTheme.accentGreen;
+    } else {
+      backgroundColor = index % 2 == 0
+          ? AppTheme.darkContainer.withValues(alpha: 0.3)
+          : Colors.transparent;
+      textColor = AppTheme.textPrimary;
+    }
 
     return InkWell(
       onTap: hasAnyError ? () => _showFrameErrorDetails(frame, errors) : null,
@@ -569,8 +1533,8 @@ class _MonitorScreenState extends State<MonitorScreen> {
           color: backgroundColor,
           borderRadius: BorderRadius.circular(8),
           border: hasAnyError 
-              ? Border.all(color: AppTheme.accentRed.withOpacity(0.5), width: 1)
-              : Border.all(color: AppTheme.darkBorder.withOpacity(0.3), width: 0.5),
+              ? Border.all(color: AppTheme.accentRed.withValues(alpha: 0.5), width: 1)
+              : Border.all(color: AppTheme.darkBorder.withValues(alpha: 0.3), width: 0.5),
         ),
         child: Row(
         children: [
@@ -578,7 +1542,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
           SizedBox(
             width: 50,
             child: Text(
-              '0x${frame.id.toRadixString(16).toUpperCase().padLeft(3, '0')}',
+              frame.idHex,
               style: TextStyle(
                 fontFamily: 'monospace',
                 color: textColor,
@@ -651,11 +1615,15 @@ class _MonitorScreenState extends State<MonitorScreen> {
                   width: 8,
                   height: 8,
                   decoration: BoxDecoration(
-                    color: hasAnyError ? AppTheme.accentRed : AppTheme.accentGreen,
+                    color: hasAnyError
+                        ? AppTheme.accentRed
+                        : isRtr
+                            ? AppTheme.primaryAmber
+                            : AppTheme.accentGreen,
                     shape: BoxShape.circle,
                     boxShadow: [
                       BoxShadow(
-                        color: (hasAnyError ? AppTheme.accentRed : AppTheme.accentGreen).withOpacity(0.5),
+                        color: textColor.withValues(alpha: 0.5),
                         blurRadius: 4,
                         spreadRadius: 1,
                       ),
@@ -665,9 +1633,9 @@ class _MonitorScreenState extends State<MonitorScreen> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    hasAnyError ? 'ERROR' : 'OK',
+                    hasAnyError ? 'ERROR' : isRtr ? 'RTR' : isExt ? 'EXT' : 'OK',
                     style: TextStyle(
-                      color: hasAnyError ? AppTheme.accentRed : AppTheme.accentGreen,
+                      color: textColor,
                       fontWeight: FontWeight.bold,
                       fontSize: 10,
                     ),
@@ -692,7 +1660,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
           backgroundColor: AppTheme.darkSurface,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
-            side: BorderSide(color: AppTheme.primaryOrange.withOpacity(0.3)),
+            side: BorderSide(color: AppTheme.primaryOrange.withValues(alpha: 0.3)),
           ),
           title: Row(
             children: [
@@ -727,7 +1695,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
                 decoration: BoxDecoration(
                   color: AppTheme.darkContainer,
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: AppTheme.primaryAmber.withOpacity(0.3)),
+                  border: Border.all(color: AppTheme.primaryAmber.withValues(alpha: 0.3)),
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -746,7 +1714,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
               // Show all detected errors with proper names
               ...errors.map((error) => _buildErrorDetailRow(
                 _getErrorTypeName(error.type),
-                error.description,
+                '[${error.origin.name.toUpperCase()}] ${error.description}',
                 _getSeverityColor(error.severity),
               )),
             ],
@@ -814,7 +1782,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
           backgroundColor: AppTheme.darkSurface,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
-            side: BorderSide(color: AppTheme.primaryOrange.withOpacity(0.3)),
+            side: BorderSide(color: AppTheme.primaryOrange.withValues(alpha: 0.3)),
           ),
           title: Row(
             children: [
@@ -849,11 +1817,11 @@ class _MonitorScreenState extends State<MonitorScreen> {
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
                     gradient: criticalRate ? 
-                      LinearGradient(colors: [AppTheme.accentRed.withOpacity(0.1), AppTheme.accentRed.withOpacity(0.05)]) :
-                      LinearGradient(colors: [AppTheme.primaryOrange.withOpacity(0.1), AppTheme.primaryAmber.withOpacity(0.05)]),
+                      LinearGradient(colors: [AppTheme.accentRed.withValues(alpha: 0.1), AppTheme.accentRed.withValues(alpha: 0.05)]) :
+                      LinearGradient(colors: [AppTheme.primaryOrange.withValues(alpha: 0.1), AppTheme.primaryAmber.withValues(alpha: 0.05)]),
                     borderRadius: BorderRadius.circular(12),
                     border: Border.all(
-                      color: criticalRate ? AppTheme.accentRed.withOpacity(0.3) : AppTheme.primaryOrange.withOpacity(0.3),
+                      color: criticalRate ? AppTheme.accentRed.withValues(alpha: 0.3) : AppTheme.primaryOrange.withValues(alpha: 0.3),
                     ),
                   ),
                   child: Column(
@@ -884,8 +1852,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
                 
                 ...CanErrorType.values
                     .where((type) => type != CanErrorType.none && (_errorStats[type] ?? 0) > 0)
-                    .map((type) => _buildErrorStatRow(type, _errorStats[type] ?? 0))
-                    .toList(),
+                    .map((type) => _buildErrorStatRow(type, _errorStats[type] ?? 0)),
                 
                 if (recommendations.isNotEmpty) ...[
                   const SizedBox(height: 16),
@@ -929,9 +1896,9 @@ class _MonitorScreenState extends State<MonitorScreen> {
       margin: const EdgeInsets.only(bottom: 4),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
+        color: color.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: color.withOpacity(0.3)),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
       child: Row(
         children: [
@@ -1085,7 +2052,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
-                color: (_errorRate > 15 ? AppTheme.accentRed : AppTheme.accentGreen).withOpacity(0.1),
+                color: (_errorRate > 15 ? AppTheme.accentRed : AppTheme.accentGreen).withValues(alpha: 0.1),
                 borderRadius: BorderRadius.circular(12),
                 border: Border.all(
                   color: _errorRate > 15 ? AppTheme.accentRed : AppTheme.accentGreen,
@@ -1177,8 +2144,8 @@ class ErrorRateChartPainter extends CustomPainter {
         begin: Alignment.topCenter,
         end: Alignment.bottomCenter,
         colors: [
-          _getColorForValue(data.last).withOpacity(0.3),
-          _getColorForValue(data.last).withOpacity(0.1),
+          _getColorForValue(data.last).withValues(alpha: 0.3),
+          _getColorForValue(data.last).withValues(alpha: 0.1),
         ],
       );
 

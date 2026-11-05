@@ -4,6 +4,7 @@ import 'package:flutter_animate/flutter_animate.dart';
 import '../../domain/models/can_session.dart';
 import '../../domain/services/can_session_service.dart';
 import '../../core/theme.dart';
+import 'session_analytics_detail_screen.dart';
 import '../widgets/animated_widgets.dart';
 
 /// Analytics Extension screen для перегляду збережених сесій та розширеної аналітики
@@ -493,11 +494,9 @@ class _AnalyticsExtensionScreenState extends State<AnalyticsExtensionScreen> {
   }
 
   void _viewSessionDetails(CanSession session) {
-    // TODO: Navigate to detailed session view
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Detailed analytics for ${session.name} coming soon!'),
-        backgroundColor: AppTheme.primaryOrange,
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => SessionAnalyticsDetailScreen(session: session),
       ),
     );
   }
