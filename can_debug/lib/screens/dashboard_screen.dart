@@ -1,5 +1,6 @@
 ﻿import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
+import 'dart:io';
 
 import '../core/theme.dart';
 import '../presentation/widgets/animated_widgets.dart';
@@ -8,6 +9,7 @@ import '../domain/simulator/can_frame_simulator.dart';
 import '../presentation/screens/monitor_screen.dart';
 import '../presentation/screens/modern_monitor_screen.dart';
 import '../presentation/screens/ble_connect_screen.dart';
+import '../presentation/screens/serial_connect_screen.dart';
 
 class DashboardScreen extends StatelessWidget {
   const DashboardScreen({super.key});
@@ -209,6 +211,7 @@ class DashboardScreen extends StatelessWidget {
                       const SizedBox(height: 24),
 
                       // Hardware Section
+                      if (Platform.isWindows || Platform.isAndroid)
                       AnimatedCard(
                         child: Padding(
                           padding: const EdgeInsets.all(24),
@@ -223,8 +226,8 @@ class DashboardScreen extends StatelessWidget {
                                     color: Colors.blueAccent.withValues(alpha: 0.4),
                                   ),
                                 ),
-                                child: const Icon(
-                                  Icons.bluetooth,
+                                child: Icon(
+                                  Platform.isWindows ? Icons.usb : Icons.bluetooth,
                                   size: 40,
                                   color: Colors.blueAccent,
                                 ),
@@ -239,7 +242,7 @@ class DashboardScreen extends StatelessWidget {
                               ),
                               const SizedBox(height: 8),
                               Text(
-                                'Connect to the physical CAN bus stand via Bluetooth LE',
+                                Platform.isWindows ? 'Connect ESP32 RECEIVER via USB Serial' : 'Connect to the physical CAN bus stand via Bluetooth LE',
                                 style: theme.textTheme.bodyMedium?.copyWith(
                                   color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
                                 ),
@@ -252,15 +255,15 @@ class DashboardScreen extends StatelessWidget {
                                   onPressed: () => Navigator.push(
                                     context,
                                     MaterialPageRoute(
-                                      builder: (_) => const BleConnectScreen(),
+                                      builder: (_) => Platform.isWindows ? const SerialConnectScreen() : const BleConnectScreen(),
                                     ),
                                   ),
-                                  child: const Row(
+                                  child: Row(
                                     mainAxisAlignment: MainAxisAlignment.center,
                                     children: [
-                                      Icon(Icons.bluetooth_searching),
-                                      SizedBox(width: 8),
-                                      Text('Connect to Stand'),
+                                      Icon(Platform.isWindows ? Icons.usb : Icons.bluetooth_searching),
+                                      const SizedBox(width: 8),
+                                      const Text('Connect to Stand'),
                                     ],
                                   ),
                                 ),

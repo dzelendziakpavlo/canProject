@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:get_it/get_it.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import '../domain/simulator/can_frame_simulator.dart';
 import '../domain/detection/can_error_checker.dart';
@@ -26,6 +29,11 @@ void setupServiceLocator() {
 
 /// Initialize all dependencies
 Future<void> initializeDependencies() async {
+  // Keep Android's plugin factory; only desktop Windows uses SQLite FFI.
+  if (Platform.isWindows) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  }
   // Setup service locator
   setupServiceLocator();
   

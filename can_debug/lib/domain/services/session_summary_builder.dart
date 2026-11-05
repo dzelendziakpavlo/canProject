@@ -14,9 +14,11 @@ class SessionSummaryBuilder {
   CanSessionSummary build(CanSession session) {
     final frames = List<CanFrame>.from(session.frames);
     final events = List<CanSessionEvent>.from(session.events);
-    final errorStats = _checker.getErrorStatistics(frames);
-    final errorFrames = frames.where((frame) => _checker.hasError(frame)).length;
-    final errorRate = frames.isEmpty ? 0.0 : (errorFrames / frames.length) * 100.0;
+    final truncated = session.totalFrames > frames.length;
+    final totalFrames = truncated ? session.totalFrames : frames.length;
+    final errorStats = truncated ? session.errorStats : _checker.getErrorStatistics(frames);
+    final errorFrames = truncated ? session.errorFrames : frames.where((frame) => _checker.hasError(frame)).length;
+    final errorRate = truncated ? session.errorRate : (frames.isEmpty ? 0.0 : (errorFrames / frames.length) * 100.0);
 
     final sourceStateCounts = <String, int>{};
     final canIdCounts = <int, int>{};
@@ -92,11 +94,11 @@ class SessionSummaryBuilder {
       sessionId: session.id,
       sessionName: session.name,
       sourceName: session.sourceName,
-      monitorMode: session.sourceName == null ? 'unknown' : (session.sourceName!.toLowerCase().contains('ble') || session.sourceName!.toLowerCase().contains('can') ? 'hardware' : 'simulator'),
+      monitorMode: session.sourceName == null ? 'unknown' : (session.sourceName!.toLowerCase().contains('ble') || session.sourceName!.toLowerCase().contains('can') || session.sourceName!.startsWith('USB Serial') ? 'hardware' : 'simulator'),
       startTime: session.startTime,
       endTime: session.endTime,
       duration: session.duration,
-      totalFrames: frames.length,
+      totalFrames: totalFrames,
       errorFrames: errorFrames,
       errorRate: errorRate,
       statsSnapshotsCount: session.statsSnapshots.length,

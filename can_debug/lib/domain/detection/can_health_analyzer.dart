@@ -37,6 +37,7 @@ class CanHealthAnalyzer {
     required int errorDetectedEvents,
     required int reconnectCount,
     required bool busIsSilent,
+    String transport = 'ble',
   }) {
     var score = 100;
     final findings = <CanHealthFinding>[];
@@ -124,8 +125,10 @@ class CanHealthAnalyzer {
       findings.add(CanHealthFinding(
         severity: reconnectCount >= 5 ? SessionSeverity.critical : SessionSeverity.high,
         title: 'Reconnect storm',
-        explanation: 'The BLE source has reconnected $reconnectCount times during this run.',
-        recommendation: 'Check receiver power, BLE signal strength, and Android permissions.',
+        explanation: 'The ${transport == 'usbSerial' ? 'USB Serial' : 'BLE'} source has reconnected $reconnectCount times during this run.',
+        recommendation: transport == 'usbSerial'
+            ? 'Check receiver power, USB cable, COM port, and competing serial programs.'
+            : 'Check receiver power, BLE signal strength, and Android permissions.',
       ));
     }
 

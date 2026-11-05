@@ -50,6 +50,7 @@ class CanAnomalyAnalyzer {
     required List<CanFrame> frames,
     required List<CanStats> statsSnapshots,
     required List<CanSessionEvent> events,
+    String transport = 'ble',
   }) {
     final anomalies = <CanAnomaly>[];
     final orderedFrames = List<CanFrame>.from(frames)
@@ -63,7 +64,7 @@ class CanAnomalyAnalyzer {
     _addBurstTraffic(anomalies, orderedFrames);
     _addSilentPeriods(anomalies, orderedFrames);
     _addUnstableRecovery(anomalies, orderedStats);
-    _addReconnectStorm(anomalies, events);
+    _addReconnectStorm(anomalies, events, transport);
     _addCounterSpike(anomalies, orderedStats);
 
     return anomalies;
@@ -177,7 +178,7 @@ class CanAnomalyAnalyzer {
     ));
   }
 
-  void _addReconnectStorm(List<CanAnomaly> anomalies, List<CanSessionEvent> events) {
+  void _addReconnectStorm(List<CanAnomaly> anomalies, List<CanSessionEvent> events, String transport) {
     final reconnects = events.where((event) =>
         event.type == CanSessionEventType.sourceStateChanged &&
         (event.data['newState']?.toString() == 'reconnecting' ||
@@ -188,9 +189,11 @@ class CanAnomalyAnalyzer {
       type: CanAnomalyType.reconnectStorm,
       severity: reconnects >= 5 ? SessionSeverity.critical : SessionSeverity.high,
       confidence: 1.0,
-      title: 'BLE reconnect storm',
+      title: '${transport == 'usbSerial' ? 'USB Serial' : 'BLE'} reconnect storm',
       explanation: 'The source entered reconnecting state $reconnects times.',
-      recommendation: 'Check receiver power, BLE signal strength, and Android permissions.',
+      recommendation: transport == 'usbSerial'
+          ? 'Check receiver power, USB cable, COM port, and competing serial programs.'
+          : 'Check receiver power, BLE signal strength, and Android permissions.',
     ));
   }
 

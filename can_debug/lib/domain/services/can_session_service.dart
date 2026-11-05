@@ -82,6 +82,10 @@ class CanSessionService {
     if (_currentSession == null) return;
 
     final updatedEvents = List<CanSessionEvent>.from(_currentSession!.events)..add(event);
+    // Complete USB wire history is on disk; bound the live analysis snapshot.
+    if (_currentSession!.sourceName?.startsWith('USB Serial') == true && updatedEvents.length > 2000) {
+      updatedEvents.removeRange(0, updatedEvents.length - 2000);
+    }
     _currentSession = _currentSession!.updateWith(events: updatedEvents);
   }
 
@@ -90,6 +94,9 @@ class CanSessionService {
     if (_currentSession == null) return;
 
     final updatedSnapshots = List<CanStats>.from(_currentSession!.statsSnapshots)..add(stats);
+    if (_currentSession!.sourceName?.startsWith('USB Serial') == true && updatedSnapshots.length > 600) {
+      updatedSnapshots.removeRange(0, updatedSnapshots.length - 600);
+    }
     _currentSession = _currentSession!.updateWith(statsSnapshots: updatedSnapshots);
   }
 

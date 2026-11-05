@@ -7,12 +7,14 @@ import '../../domain/models/can_stats.dart';
 import '../../domain/models/can_session.dart';
 import '../../domain/models/can_session_event.dart';
 import '../../domain/source/can_frame_source.dart';
+import '../../domain/source/serial_can_source.dart';
 import '../../domain/simulator/can_frame_simulator.dart';
 import '../../domain/detection/can_error_checker.dart';
 import '../../domain/detection/can_health_analyzer.dart';
 import '../../domain/detection/can_anomaly_analyzer.dart';
 import '../../domain/services/can_session_service.dart';
 import '../../core/theme.dart';
+import '../../core/windows_capture_guard.dart';
 import '../widgets/animated_widgets.dart';
 
 /// Monitor screen that displays live CAN frame data
@@ -26,6 +28,10 @@ class MonitorScreen extends StatefulWidget {
 
 class _MonitorScreenState extends State<MonitorScreen> {
   late CanFrameSource _source;
+  SerialCanSource? get _serial => _source is SerialCanSource ? _source as SerialCanSource : null;
+  int _uiDroppedFrames = 0;
+  DateTime? _monitorStartedAt;
+  WindowsCaptureGuard? _windowGuard;
   late StreamSubscription<CanFrame> _subscription;
   final CanErrorChecker _errorChecker = CanErrorChecker();
   final CanHealthAnalyzer _healthAnalyzer = CanHealthAnalyzer();
@@ -101,6 +107,13 @@ class _MonitorScreenState extends State<MonitorScreen> {
   void initState() {
     super.initState();
     _source = widget.source ?? CanFrameSimulator();
+    _sourceState = _serial?.state;
+    if (_serial != null) {
+      _windowGuard = WindowsCaptureGuard(() async {
+        if (_isRunning) { await _stopSimulation(); } else { await _source.stop(); }
+      });
+      unawaited(_windowGuard!.enable());
+    }
     _stateSub = _source.stateStream.listen((s) {
       final previousState = _sourceState;
       if (s == SourceState.reconnecting) _reconnectCount++;
@@ -147,7 +160,15 @@ class _MonitorScreenState extends State<MonitorScreen> {
           'reasonCode': stats.reasonCode,
         },
       );
-      final prev = _latestStats;
+      final previous = _latestStats;
+      final countersReset = previous != null && (stats.rxTotal < previous.rxTotal ||
+          stats.busErrorCount < previous.busErrorCount ||
+          (stats.uptimeMs != null && previous.uptimeMs != null && stats.uptimeMs! < previous.uptimeMs!));
+      final prev = countersReset ? null : previous;
+      if (countersReset) {
+        _recordSourceEvent(type: CanSessionEventType.note,
+          message: 'Receiver counters reset; starting a new delta baseline');
+      }
 
       // TWAI deltas since last stats packet (arrives every ~1 s from ESP32)
       final errorDelta  = stats.busErrorCount - (prev?.busErrorCount ?? stats.busErrorCount);
@@ -216,6 +237,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
 
   @override
   void dispose() {
+    _windowGuard?.dispose();
     _uiTimer?.cancel();
     _stateSub?.cancel();
     _statsStreamSub?.cancel();
@@ -228,7 +250,13 @@ class _MonitorScreenState extends State<MonitorScreen> {
   /// The UI timer flushes the buffer at 20 fps, keeping the render thread smooth
   /// even when the ESP32 sends 200+ frames/s on a loaded CAN bus.
   void _setupFrameListener() {
-    _subscription = _source.frameStream.listen(_pendingFrames.add);
+    _subscription = _source.frameStream.listen((frame) {
+      _lastFrameAt = DateTime.now();
+      // The independent experiment journal already received this frame.
+      // Bound display backlog even if rendering temporarily stalls.
+      if (_pendingFrames.length >= 4096) { _uiDroppedFrames++; return; }
+      _pendingFrames.add(frame);
+    });
     _uiTimer?.cancel();
     _uiTimer = Timer.periodic(const Duration(milliseconds: 50), (_) => _flushPending());
   }
@@ -245,8 +273,9 @@ class _MonitorScreenState extends State<MonitorScreen> {
 
     // Frame-timeout check: only for hardware BLE source while streaming
     if (_source.statsStream != null && _sourceState == SourceState.streaming) {
-      final silent = _lastFrameAt != null &&
-          now.difference(_lastFrameAt!) > _frameTimeoutDuration;
+      final origin = _lastFrameAt ?? _monitorStartedAt;
+      final silent = origin != null && now.difference(origin) > _frameTimeoutDuration &&
+          (_serial == null || (_serial!.lastMessageAt != null && now.toUtc().difference(_serial!.lastMessageAt!) < const Duration(seconds: 4)));
       if (silent != _busIsSilent) setState(() => _busIsSilent = silent);
     }
 
@@ -263,13 +292,14 @@ class _MonitorScreenState extends State<MonitorScreen> {
 
     final prevTotal = _totalFrames;
 
-    _lastFrameAt = DateTime.now();
     _recentFrameTimes.addAll(batch.map((frame) => frame.timestamp));
     _recentFrameTimes.removeWhere(
       (timestamp) => now.difference(timestamp) > const Duration(seconds: 1),
     );
     _framesPerSecond = _recentFrameTimes.length.toDouble();
-    if (_busIsSilent) setState(() => _busIsSilent = false);
+    if (_busIsSilent && _lastFrameAt != null && now.difference(_lastFrameAt!) < _frameTimeoutDuration) {
+      setState(() => _busIsSilent = false);
+    }
 
     setState(() {
       for (final frame in batch) {
@@ -365,6 +395,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
       errorDetectedEvents: _errorFrames,
       reconnectCount: _reconnectCount,
       busIsSilent: _busIsSilent,
+      transport: _serial != null ? 'usbSerial' : 'ble',
     );
     _recordNewHealthFindings(report);
     if (mounted &&
@@ -405,6 +436,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
       frames: _frames,
       statsSnapshots: session?.statsSnapshots ?? const [],
       events: session?.events ?? const [],
+      transport: _serial != null ? 'usbSerial' : 'ble',
     );
     final previousTitles = _anomalies.map((anomaly) => anomaly.title).toSet();
     for (final anomaly in anomalies) {
@@ -438,7 +470,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
       case CanAnomalyType.silentPeriod:
         return DiagnosticCause.silentBus;
       case CanAnomalyType.reconnectStorm:
-        return DiagnosticCause.bleLoss;
+        return _serial != null ? DiagnosticCause.transportLoss : DiagnosticCause.bleLoss;
       case CanAnomalyType.counterSpike:
       case CanAnomalyType.repeatedError:
       case CanAnomalyType.burstTraffic:
@@ -475,7 +507,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
       case 'RX overflow':
         return DiagnosticCause.rxOverflow;
       case 'Reconnect storm':
-        return DiagnosticCause.bleLoss;
+        return _serial != null ? DiagnosticCause.transportLoss : DiagnosticCause.bleLoss;
       default:
         return DiagnosticCause.unknown;
     }
@@ -483,6 +515,10 @@ class _MonitorScreenState extends State<MonitorScreen> {
 
   /// Start the CAN frame simulation
   void _startSimulation() async {
+    if (_isRunning) return;
+    _monitorStartedAt = DateTime.now();
+    _lastFrameAt = null;
+    _latestStats = null;
     setState(() {
       _isRunning = true;
     });
@@ -498,6 +534,12 @@ class _MonitorScreenState extends State<MonitorScreen> {
       },
     );
     await _source.start();
+    if (!mounted) return;
+    if (_serial != null) {
+      setState(() => _sourceState = _serial!.state);
+      _recordSourceEvent(type: CanSessionEventType.note, message: 'USB Serial experimental capture',
+        data: {..._serial!.connectionMetadata, 'monitorMode': 'hardware'});
+    }
   }
 
   /// Stop the CAN frame simulation
@@ -506,6 +548,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
       _isRunning = false;
     });
     await _source.stop();
+    _flushPending();
     _recordSourceEvent(
       type: CanSessionEventType.sourceStopped,
       message: 'Monitoring stopped for ${_source.name}',
@@ -518,6 +561,8 @@ class _MonitorScreenState extends State<MonitorScreen> {
         'framesPerSecond': _framesPerSecond,
         'lastFrameAgeMs': _lastFrameAt == null ? null : DateTime.now().difference(_lastFrameAt!).inMilliseconds,
         'reconnectCount': _reconnectCount,
+        if (_serial != null) ..._serial!.connectionMetadata,
+        'uiDroppedFrames': _uiDroppedFrames,
       },
     );
     
@@ -613,8 +658,8 @@ class _MonitorScreenState extends State<MonitorScreen> {
                 borderRadius: BorderRadius.circular(12),
                 side: BorderSide(color: AppTheme.primaryOrange.withValues(alpha: 0.3)),
               ),
-              title: Text('Simulation running', style: TextStyle(color: AppTheme.textPrimary)),
-              content: Text('A simulation is still running. What would you like to do?', style: TextStyle(color: AppTheme.textSecondary)),
+              title: Text('Monitoring running', style: TextStyle(color: AppTheme.textPrimary)),
+              content: Text('Monitoring is still running. Stop to flush the experimental log and save this session.', style: TextStyle(color: AppTheme.textSecondary)),
               actions: [
                 TextButton(onPressed: () => Navigator.of(context).pop('cancel'), child: const Text('Cancel')),
                 TextButton(onPressed: () => Navigator.of(context).pop('leave'), child: const Text('Leave without saving')),
@@ -656,7 +701,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
               ),
             ),
             const SizedBox(width: 12),
-            const Text('CAN Monitor'),
+            const Flexible(child: Text('CAN Monitor', overflow: TextOverflow.ellipsis)),
           ],
         ),
         backgroundColor: AppTheme.darkSurface,
@@ -666,7 +711,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
           AnimatedIconButton(
             icon: _isRunning ? Icons.pause_circle_filled : Icons.play_circle_filled,
             onPressed: _isRunning ? () => _stopSimulation() : _startSimulation,
-            tooltip: _isRunning ? 'Pause' : 'Start',
+            tooltip: _isRunning ? 'Disconnect & Save' : 'Connect / Start',
             color: _isRunning ? AppTheme.primaryAmber : AppTheme.accentGreen,
           ).animate().scale(duration: 200.ms),
           AnimatedIconButton(
@@ -684,10 +729,13 @@ class _MonitorScreenState extends State<MonitorScreen> {
           const SizedBox(width: 8),
         ],
       ),
-      body: Column(
+      body: LayoutBuilder(builder: (context, constraints) => SingleChildScrollView(
+        child: SizedBox(height: _serial != null ? constraints.maxHeight.clamp(980.0, double.infinity) : constraints.maxHeight,
+          child: Column(
         children: [
           // BLE connection state banner (hidden for simulator)
           if (_source.statsStream != null) _buildConnectionBanner(),
+          if (_serial != null) _buildSerialStatus(),
 
           // Bus-off / error-passive / silent alert (BLE only)
           if (_latestStats != null || _busIsSilent) _buildBusOffBanner(),
@@ -727,7 +775,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
             child: _buildErrorRateChart(),
           ).animate(delay: 1200.ms).fadeIn().slideY(begin: 0.3, end: 0),
         ],
-      ),
+      )))),
       )
     );
   }
@@ -1038,7 +1086,9 @@ class _MonitorScreenState extends State<MonitorScreen> {
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: stateColor.withValues(alpha: 0.3)),
       ),
-      child: Row(
+      child: Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        runSpacing: 8,
         children: [
           // Bus state chip
           Container(
@@ -1085,7 +1135,7 @@ class _MonitorScreenState extends State<MonitorScreen> {
               child: const Text('250k≠500k', style: TextStyle(color: AppTheme.primaryAmber, fontSize: 10, fontWeight: FontWeight.bold)),
             ),
           ],
-          const Spacer(),
+          const SizedBox(width: 16),
           Text(
             'TWAI ${_formatTime(stats.timestamp)}',
             style: const TextStyle(color: AppTheme.textMuted, fontSize: 10),
@@ -1122,12 +1172,12 @@ class _MonitorScreenState extends State<MonitorScreen> {
     final (label, color, showSpinner) = switch (state) {
       SourceState.connecting    => ('Connecting to ESP32…',          AppTheme.primaryOrange, true),
       SourceState.scanning      => ('Scanning for ESP32 CAN Stand…', AppTheme.primaryOrange, true),
-      SourceState.connected     => ('Connected — subscribing…',      AppTheme.primaryAmber,  true),
+      SourceState.connected     => (_serial != null ? 'COM port open — waiting for JSON…' : 'Connected — subscribing…', AppTheme.primaryAmber, true),
       SourceState.streaming     => ('Streaming from ESP32 CAN Stand', AppTheme.accentGreen,  false),
       SourceState.reconnecting  => ('Reconnecting to ESP32…',         AppTheme.primaryOrange, true),
-      SourceState.disconnected  => ('Disconnected — reconnecting…',  AppTheme.accentRed,    true),
+      SourceState.disconnected  => (_serial != null ? 'USB disconnected — stop, then reconnect' : 'Disconnected — reconnecting…', AppTheme.accentRed, _serial == null),
       SourceState.lost          => ('CAN Stand not found',             AppTheme.accentRed,    false),
-      SourceState.error         => ('Connection error — retrying…',  AppTheme.accentRed,    true),
+      SourceState.error         => (_serial != null ? 'USB Serial error — manual reconnect' : 'Connection error — retrying…', AppTheme.accentRed, _serial == null),
       SourceState.idle          => ('', AppTheme.textMuted, false),
     };
 
@@ -1148,15 +1198,37 @@ class _MonitorScreenState extends State<MonitorScreen> {
           else
             Icon(Icons.circle, size: 10, color: color),
           const SizedBox(width: 10),
-          Text(label, style: TextStyle(color: color, fontSize: 13)),
-          const Spacer(),
-          Text(_source.name, style: const TextStyle(color: AppTheme.textMuted, fontSize: 11)),
+          Expanded(child: Text('$label · ${_source.name}', style: TextStyle(color: color, fontSize: 13))),
         ],
       ),
     );
   }
 
   /// Build the statistics panel at the top
+  Widget _buildSerialStatus() {
+    final serial = _serial!;
+    final stale = serial.lastMessageAt != null && DateTime.now().toUtc().difference(serial.lastMessageAt!) > const Duration(seconds: 4);
+    return Padding(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Row(children: [
+        Expanded(child: Text('USB RX ${serial.receivedFrames} · stats ${serial.receivedStats} · bytes ${serial.bytesRead} · reads ${serial.readOperations} · lines ${serial.completedLines} · rejected ${serial.serialParseErrors} · sequence gaps ${serial.sequenceGaps} · UI skipped $_uiDroppedFrames${stale ? ' · telemetry stale' : ''}',
+          style: const TextStyle(fontSize: 11))),
+        IconButton(icon: const Icon(Icons.description_outlined), tooltip: 'Experimental recording details',
+          onPressed: () => showDialog<void>(context: context, builder: (context) => AlertDialog(
+            title: const Text('Experimental recording'),
+            content: SingleChildScrollView(child: SelectableText(
+              'CSV: ${serial.journal?.csvPath ?? 'not opened'}\nJSONL: ${serial.journal?.jsonlPath ?? 'not opened'}\n'
+              'Written: ${serial.journal?.writtenRecords ?? 0}\n'
+              'Read diagnostics: bytesRead=${serial.bytesRead}, readOperations=${serial.readOperations}, readErrors=${serial.readErrors}, completedLines=${serial.completedLines}, decodedFrames=${serial.receivedFrames}, decodedStats=${serial.receivedStats}\n'
+              'Native reader: ${serial.transportDiagnostics}\n'
+              'Serial error: ${serial.lastError ?? 'none'}\nParse error: ${serial.lastParseError ?? 'none'}\n'
+              'Recording error: ${serial.journal?.failure ?? 'none'}\n'
+              'Firmware transport counters: ${serial.firmwareCounters}\n'
+              'The recording includes all received messages independently of the 100-frame display buffer.')),
+            actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))]))),
+        if (serial.lastError != null) const Tooltip(message: 'Open recording details for the error', child: Icon(Icons.error_outline, color: AppTheme.accentRed)),
+      ]));
+  }
+
   Widget _buildStatisticsPanel() {
     return Container(
       width: double.infinity,
@@ -1420,7 +1492,8 @@ class _MonitorScreenState extends State<MonitorScreen> {
         child: Center(
           child: Padding(
             padding: const EdgeInsets.all(32.0),
-            child: Column(
+            child: SingleChildScrollView(child: Column(
+              mainAxisSize: MainAxisSize.min,
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Container(
@@ -1453,13 +1526,13 @@ class _MonitorScreenState extends State<MonitorScreen> {
                       children: [
                         Icon(Icons.play_arrow),
                         SizedBox(width: 8),
-                        Text('Start Simulation'),
+                        Text('Start Monitoring'),
                       ],
                     ),
                   ).animate(delay: 1000.ms).fadeIn().scale(begin: const Offset(0.8, 0.8)),
                 ],
               ],
-            ),
+            )),
           ),
         ),
       );

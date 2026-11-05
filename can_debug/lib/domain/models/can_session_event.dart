@@ -23,6 +23,7 @@ enum DiagnosticCause {
   baudMismatch,
   busNoise,
   bleLoss,
+  transportLoss,
   rxOverflow,
   busOff,
   arbitrationLost,

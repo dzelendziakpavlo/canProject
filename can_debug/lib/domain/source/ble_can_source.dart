@@ -1,5 +1,6 @@
   import 'dart:async';
   import 'dart:convert';
+  import 'dart:io';
 
   import 'package:flutter/foundation.dart';
 
@@ -61,6 +62,7 @@
 
     @override
     Future<void> start() async {
+      if (!Platform.isAndroid) { _emit(SourceState.error); return; }
       if (_running || _disposed) return;
       _running = true;
       _reconnectAttempts = 0;
@@ -265,6 +267,7 @@
     }
 
     Future<void> _tearDown() async {
+      if (!Platform.isAndroid) return;
       await _framesSub?.cancel();
       await _statsSub?.cancel();
       await _connSub?.cancel();

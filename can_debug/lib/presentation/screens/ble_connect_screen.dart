@@ -45,6 +45,12 @@ class _BleConnectScreenState extends State<BleConnectScreen> {
   void initState() {
     super.initState();
 
+    // Guard plugin access itself, including direct navigation on desktop.
+    if (!Platform.isAndroid) {
+      _errorMessage = 'BLE stand connection is available on Android. Use USB Serial on Windows.';
+      return;
+    }
+
     _resultsSub = FlutterBluePlus.scanResults.listen((results) {
       if (!mounted) return;
       setState(() {
@@ -75,7 +81,7 @@ class _BleConnectScreenState extends State<BleConnectScreen> {
   void dispose() {
     _resultsSub?.cancel();
     _isScanSub?.cancel();
-    FlutterBluePlus.stopScan();
+    if (Platform.isAndroid) FlutterBluePlus.stopScan();
     super.dispose();
   }
 
@@ -121,6 +127,7 @@ class _BleConnectScreenState extends State<BleConnectScreen> {
   }
 
   Future<void> _startScan() async {
+    if (!Platform.isAndroid) return;
     if (!await _requestPermissions()) return;
 
     final adapterState = await FlutterBluePlus.adapterState.first;

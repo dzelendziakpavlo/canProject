@@ -1,6 +1,7 @@
 #include "flutter_window.h"
 
 #include <optional>
+#include <flutter/standard_method_codec.h>
 
 #include "flutter/generated_plugin_registrant.h"
 
@@ -25,6 +26,24 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  capture_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+      flutter_controller_->engine()->messenger(), "can_debug/capture_window",
+      &flutter::StandardMethodCodec::GetInstance());
+  capture_channel_->SetMethodCallHandler(
+      [this](const auto& call, auto result) {
+        if (call.method_name() == "setCaptureActive") {
+          const auto* active = std::get_if<bool>(call.arguments());
+          capture_active_ = active != nullptr && *active;
+          close_requested_ = false;
+          result->Success();
+        } else if (call.method_name() == "closeWindow") {
+          capture_active_ = false;
+          result->Success();
+          PostMessage(GetHandle(), WM_CLOSE, 0, 0);
+        } else {
+          result->NotImplemented();
+        }
+      });
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -40,6 +59,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  capture_channel_ = nullptr;
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -51,6 +71,13 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == WM_CLOSE && capture_active_ && capture_channel_) {
+    if (!close_requested_) {
+      close_requested_ = true;
+      capture_channel_->InvokeMethod("closeRequested", nullptr);
+    }
+    return 0;
+  }
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =
