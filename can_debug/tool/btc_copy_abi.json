@@ -1,0 +1,30 @@
+{
+  "arduinoCore": "3.3.10",
+  "idfVersion": "5.5.4",
+  "idfCommit": "735507283d",
+  "target": "esp32 Xtensa 32-bit little-endian Bluedroid",
+  "installedLibbtSha256": "d500529efd1d391492a4e5798f39f722e3bf0bbc359ff7c819bce56b1ca7141f",
+  "callback": "void btc_gatts_arg_deep_copy(struct btc_msg*, void* destination, void* source)",
+  "messageHeader": {"bytes": 4, "signalOffset": 0, "profileOffset": 2, "actionOffset": 3},
+  "messageArgumentOffset": 4,
+  "handlerProfileTable": {"symbol": "profile_tab", "entryBytes": 8, "gattsProfile": 2, "gattsCallOffset": 16},
+  "handlerNativeCas": {
+    "primitive": "xt_utils_compare_and_set native XCHAL_HAVE_S32C1I branch; aligned internal DRAM only",
+    "headers": {
+      "include/xtensa/include/xt_utils.h": "27349e76627fe598c653c4b191f97a8615819178d7e0737e4642cb1adc360aad",
+      "include/xtensa/esp32/include/xtensa/config/core-isa.h": "8171435d7244c032535b495bd4e8dfb592f492275519d5657e5fa5a05fd613db"
+    }
+  },
+  "sendIndicateMessage": {"signal": 0, "profile": 2, "action": 10},
+  "sendIndicateView": {"bytes": 12, "connectionOffset": 0, "handleOffset": 2, "confirmOffset": 4, "lengthOffset": 6, "pointerOffset": 8},
+  "connectionEncoding": "((uint8_t(conn_id) << 8) | uint8_t(gatts_if))",
+  "copyTiming": "original callback allocates and memcpy's before returning to btc_transfer_context; btc_task_post follows callback return",
+  "sources": [
+    {"path": "components/bt/host/bluedroid/btc/profile/std/include/btc_gatts.h", "sha256": "6c49bb325fb95f0e07fe6b50510fd6cc27dd4d11d744e4db7c95526e87a7eb91"},
+    {"path": "components/bt/common/btc/include/btc/btc_task.h", "sha256": "65a37aea90eb5ece3867731b4c4bf60f46b0e18be2c0e666c903750f9483a35e"},
+    {"path": "components/bt/host/bluedroid/btc/profile/std/gatt/btc_gatts.c", "sha256": "99f4ae32b741c6613c6d50d29d69d89a3c173c7a85f075452f345baee32d32b5"},
+    {"path": "components/bt/host/bluedroid/api/esp_gatts_api.c", "sha256": "f2c8b9fd3fef16c4ded4f451a3cd5dac2572c2cce22f279485eb032232d3e2ea"},
+    {"path": "components/bt/common/btc/core/btc_task.c", "sha256": "9ffd5b114d91d6cf61c619bf451ace5cf10702c40acc3a66f2551ca988376e82"}
+  ],
+  "guards": ["Exact installed libbt.a hash before compilation", "Target pointer/layout static_asserts", "Core/IDF compile guards", "Final ELF callback pointer and original-call inspection", "Runtime API task/message/token plus argument and byte comparisons", "Unmatched callbacks counted without guessed pairing"]
+}

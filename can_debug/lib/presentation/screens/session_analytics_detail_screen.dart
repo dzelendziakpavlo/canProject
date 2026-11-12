@@ -1,12 +1,12 @@
+import '../../domain/services/session_pdf_report.dart';
+import '../../core/session_file_saver.dart';
+import '../../domain/services/session_export.dart';
+import '../../domain/services/recorded_frame_errors.dart';
 import 'package:flutter/material.dart';
 
-import 'dart:io';
 import 'package:intl/intl.dart';
-import 'package:path_provider/path_provider.dart';
 import 'dart:convert';
 import 'package:file_selector/file_selector.dart';
-import 'package:pdf/widgets.dart' as pw;
-import 'package:pdf/pdf.dart';
 import '../../core/theme.dart';
 import '../../domain/models/can_frame.dart';
 import '../../domain/detection/can_error_checker.dart';
@@ -25,16 +25,21 @@ class SessionAnalyticsDetailScreen extends StatefulWidget {
   const SessionAnalyticsDetailScreen({super.key, required this.session});
 
   @override
-  State<SessionAnalyticsDetailScreen> createState() => _SessionAnalyticsDetailScreenState();
+  State<SessionAnalyticsDetailScreen> createState() =>
+      _SessionAnalyticsDetailScreenState();
 }
 
-class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScreen> {
+class _SessionAnalyticsDetailScreenState
+    extends State<SessionAnalyticsDetailScreen> {
   late final SessionAnalyticsBuilder _builder;
   late final SessionComparisonBuilder _comparisonBuilder;
   late CanSessionSummary _summary;
   late SessionAnalyticsData _data;
   late CanSession _exportSession;
-  final _checker = CanErrorChecker();
+  late CanSession _session;
+  bool _loading = false;
+  String? _loadError;
+  bool _exporting = false;
 
   // Filters
   DateTimeRange? _timeRange;
@@ -54,19 +59,54 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
   @override
   void initState() {
     super.initState();
+    _session = widget.session;
     _builder = SessionAnalyticsBuilder();
     _comparisonBuilder = SessionComparisonBuilder();
-    _exportSession = widget.session;
-    _summary = CanSessionService.instance.buildSessionSummary(widget.session);
-    _data = _builder.build(widget.session);
+    _exportSession = _session;
+    _summary = CanSessionService.instance.buildSessionSummary(_session);
+    _data = _builder.build(_session);
+    if (_session.captureMetadata['storage'] == 'sqlite') {
+      _loading = true;
+      _loadStored();
+    }
+  }
+
+  Future<void> _loadStored() async {
+    try {
+      final stored = await CanSessionService.instance.readStoredSession(
+        _session,
+      );
+      if (!mounted) return;
+      setState(() {
+        _session = stored;
+        _exportSession = stored;
+        _summary = CanSessionService.instance.buildSessionSummary(stored);
+        _data = _builder.build(stored);
+        _loading = false;
+        _loadError = null;
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _loadError = e.toString();
+        });
+      }
+    }
   }
 
   void _applyFilters() {
-    final session = widget.session;
+    final session = _session;
     List<CanFrame> frames = session.frames;
 
     if (_timeRange != null) {
-      frames = frames.where((f) => !f.timestamp.isBefore(_timeRange!.start) && !f.timestamp.isAfter(_timeRange!.end)).toList();
+      frames = frames
+          .where(
+            (f) =>
+                !f.timestamp.isBefore(_timeRange!.start) &&
+                !f.timestamp.isAfter(_timeRange!.end),
+          )
+          .toList();
     }
 
     if (_idMin != null) {
@@ -78,20 +118,28 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
 
     // Filter by error types and severity
     frames = frames.where((f) {
-      final errors = _checker.analyzeFrame(f);
+      final errors = recordedFrameErrors(f);
       if (_selectedErrorTypes.isNotEmpty) {
-        if (errors.every((e) => !_selectedErrorTypes.contains(e.type))) return false;
+        if (errors.every((e) => !_selectedErrorTypes.contains(e.type))) {
+          return false;
+        }
       }
       if (_minSeverity > 1) {
         // Keep only frames that have at least one error meeting severity
-        if (errors.where((e) => e.severity >= _minSeverity).isEmpty) return false;
+        if (errors.where((e) => e.severity >= _minSeverity).isEmpty) {
+          return false;
+        }
       }
       return true;
     }).toList();
 
     final totalFrames = frames.length;
-    final errorFrames = frames.where((f) => _checker.hasError(f)).length;
-    final errorRate = totalFrames == 0 ? 0.0 : (errorFrames / totalFrames) * 100.0;
+    final errorFrames = frames
+        .where((f) => recordedFrameErrors(f).isNotEmpty)
+        .length;
+    final errorRate = totalFrames == 0
+        ? 0.0
+        : (errorFrames / totalFrames) * 100.0;
 
     final filteredSession = session.updateWith(
       frames: frames,
@@ -102,167 +150,83 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
 
     setState(() {
       _exportSession = filteredSession;
-      _summary = CanSessionService.instance.buildSessionSummary(filteredSession);
+      _summary = CanSessionService.instance.buildSessionSummary(
+        filteredSession,
+      );
       _data = _builder.build(filteredSession);
     });
   }
 
-  Future<void> _exportCsv() async {
-    final session = _exportSession;
-    final filename = '${session.name.replaceAll(' ', '_')}_${_dateFmt.format(DateTime.now())}.csv';
+  Future<void> _exportCsv() => _saveSessionExport('csv');
+  Future<void> _exportJson() => _saveSessionExport('json');
+  Future<void> _exportPdf() => _saveSessionExport('pdf');
 
-    final header = 'timestamp,id,dlc,data_hex,crc,is_corrupted,error_count,errors,error_origins,severity\n';
-    final buffer = StringBuffer();
-    buffer.write(header);
-
-    for (final f in session.frames) {
-      final errors = _checker.analyzeFrame(f);
-      final errJson = errors.map((e) => '${e.type.toString().split('.').last}:${e.severity}').join('|');
-      final origins = errors.map((e) => e.origin.name).join('|');
-      final maxSeverity = errors.isEmpty ? 0 : errors.map((e) => e.severity).reduce((a, b) => a > b ? a : b);
-      buffer.write('"${f.timestamp.toIso8601String()}",${f.id},${f.dlc},"${f.dataHex}",${f.crc},${f.isCorrupted},${errors.length},"${errJson}","${origins}",${maxSeverity}\n');
-    }
-
+  Future<void> _saveSessionExport(String extension) async {
+    if (_exporting || _loading) return;
+    setState(() => _exporting = true);
     try {
-      final dir = await getApplicationDocumentsDirectory();
-      final file = File('${dir.path}/$filename');
-      await file.writeAsString(buffer.toString());
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('CSV exported: ${file.path}')));
+      // Always reload the full immutable stored session; filters affect charts only.
+      final session = await CanSessionService.instance.readStoredSession(
+        _session,
+      );
+      final bytes = extension == 'pdf'
+          ? await SessionPdfReport.build(session)
+          : utf8.encode(
+              extension == 'csv'
+                  ? SessionExport.csv(session)
+                  : SessionExport.json(session),
+            );
+      final safeName = session.name.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final filename =
+          '${safeName}_${session.id}_${_dateFmt.format(DateTime.now())}.$extension';
+      final destination = await SessionFileSaver.save(
+        filename,
+        {
+          'csv': 'text/csv',
+          'json': 'application/json',
+          'pdf': 'application/pdf',
+        }[extension]!,
+        bytes,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            destination == null
+                ? 'Export cancelled'
+                : '${session.frames.length} frames, ${session.statsSnapshots.length} telemetry, '
+                      '${session.events.length} events exported: $destination',
+          ),
+        ),
+      );
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('CSV export failed: $e')));
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Export failed: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _exporting = false);
     }
   }
 
-  Future<void> _exportJson() async {
-    final session = _exportSession;
-    final export = <String, dynamic>{
-      'format': 'can-debug-session-export',
-      'version': 1,
-      'exportedAt': DateTime.now().toIso8601String(),
-      'session': session.toJson(),
-      'summary': _summary.toJson(),
-      'analytics': {
-        'errorStats': _data.errorStats.map((key, value) => MapEntry(key.name, value)),
-        'recommendations': _data.recommendations,
-        'errorsPerId': _data.errorsPerId
-            .map((entry) => {
-                  'id': entry.id,
-                  'totalFrames': entry.totalFrames,
-                  'errorFrames': entry.errorFrames,
-                  'errorRate': entry.percent,
-                })
-            .toList(),
-      },
-      'diagnostics': session.events
-          .where((event) => event.type == CanSessionEventType.diagnostic)
-          .map((event) => event.toJson())
-          .toList(),
-    };
-
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final filename = '${session.name.replaceAll(' ', '_')}_${_dateFmt.format(DateTime.now())}.json';
-      final file = File('${dir.path}/$filename');
-      await file.writeAsString(const JsonEncoder.withIndent('  ').convert(export));
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('JSON exported: ${file.path}')));
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('JSON export failed: $e')));
-    }
-  }
-
-  Future<void> _exportPdf() async {
-    final session = _exportSession;
-    final sessionSummary = _summary;
-    final doc = pw.Document();
-
-    final summaryRows = <String, String>{
-      'Session': sessionSummary.sessionName,
-      'Start': sessionSummary.startTime.toIso8601String(),
-      'End': sessionSummary.endTime?.toIso8601String() ?? 'ongoing',
-      'Duration': sessionSummary.duration.toString().split('.').first,
-      'Total frames': sessionSummary.totalFrames.toString(),
-      'Error frames': sessionSummary.errorFrames.toString(),
-      'Error rate': '${sessionSummary.errorRate.toStringAsFixed(2)}%',
-      'Health score': '${sessionSummary.healthScore}/100',
-      'Severity': sessionSummary.severity.displayName,
-    };
-
-    doc.addPage(pw.MultiPage(
-      pageFormat: PdfPageFormat.a4,
-      build: (pw.Context ctx) {
-        return [
-          pw.Header(level: 0, child: pw.Text('CAN Session Report: ${session.name}')),
-          pw.SizedBox(height: 8),
-          pw.Table.fromTextArray(
-            data: summaryRows.entries.map((e) => [e.key, e.value]).toList(),
-            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold),
-          ),
-          pw.SizedBox(height: 12),
-          pw.Text('Error breakdown', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 8),
-          pw.Table.fromTextArray(
-            headers: ['Error Type', 'Count'],
-            data: _data.errorStats.entries.map((e) => [e.key.toString().split('.').last, e.value.toString()]).toList(),
-          ),
-          pw.SizedBox(height: 12),
-          pw.Text('Top IDs by error percentage', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 8),
-          pw.Table.fromTextArray(
-            headers: ['ID', 'Total frames', 'Error frames', 'Error %'],
-            data: _data.errorsPerId.map((idStat) => [
-              '0x${idStat.id.toRadixString(16).toUpperCase()}',
-              idStat.totalFrames.toString(),
-              idStat.errorFrames.toString(),
-              idStat.percent.toStringAsFixed(1)
-            ]).toList(),
-          ),
-          pw.SizedBox(height: 12),
-          pw.Text('Top CAN IDs', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 8),
-          pw.Table.fromTextArray(
-            headers: ['ID', 'Frames'],
-            data: sessionSummary.topCanIds
-                .map((entry) => [entry.formattedId, entry.count.toString()])
-                .toList(),
-          ),
-          if (session.events.any((event) => event.type == CanSessionEventType.diagnostic)) ...[
-            pw.SizedBox(height: 12),
-            pw.Text('Diagnostic events', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
-            pw.SizedBox(height: 8),
-            pw.Table.fromTextArray(
-              headers: ['Time', 'Severity', 'Cause', 'Message'],
-              data: session.events
-                  .where((event) => event.type == CanSessionEventType.diagnostic)
-                  .map((event) => [
-                        event.timestamp.toIso8601String(),
-                        event.diagnosticSeverity.name,
-                        event.diagnosticCause.name,
-                        event.message,
-                      ])
-                  .toList(),
-            ),
-          ],
-        ];
-      },
-    ));
-
-    try {
-      final bytes = await doc.save();
-      final dir = await getApplicationDocumentsDirectory();
-      final filename = '${session.name.replaceAll(' ', '_')}_${_dateFmt.format(DateTime.now())}.pdf';
-      final file = File('${dir.path}/$filename');
-      await file.writeAsBytes(bytes);
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('PDF exported: ${file.path}')));
-      // Optionally preview/print
-      // await Printing.layoutPdf(onLayout: (format) => bytes);
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('PDF export failed: $e')));
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
-    final session = widget.session;
+    if (_loading || _loadError != null) {
+      return Scaffold(
+        appBar: AppBar(title: Text('Session: ${_session.name}')),
+        body: Center(
+          child: _loading
+              ? const CircularProgressIndicator()
+              : Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text('Could not read stored session: $_loadError'),
+                ),
+        ),
+      );
+    }
+    final session = _session;
 
     return Scaffold(
       backgroundColor: AppTheme.darkBackground,
@@ -279,6 +243,21 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
             _buildHeader(_summary),
             const SizedBox(height: 12),
             _buildSummaryPanel(_summary),
+            const SizedBox(height: 12),
+            Text(
+              'Session ${session.id} ? ${session.startTime.toIso8601String()} ? '
+              '${session.endTime?.toIso8601String() ?? 'ongoing'}\n'
+              'Charts use stored frame evidence only. TWAI counters describe the receiver and have no CAN ID or protocol error subtype. '
+              'Legacy snapshots may contain only the last 100 frames or synthetic telemetry markers; missing history cannot be recovered.\n'
+              'Stored frame classifications: ${_originDescription()}\n'
+              'CSV/JSON export includes all persisted records, regardless of chart filters. '
+              '${session.captureMetadata['interrupted'] == true ? 'INTERRUPTED: final in-memory tail is unknown. ' : ''}'
+              '${session.captureMetadata['storage'] == 'sqlite' ? 'SQLite committed: ${session.captureMetadata['committedFrames']} frames, ${session.captureMetadata['committedStats']} stats, ${session.captureMetadata['committedEvents']} events.' : 'Legacy snapshot: ${session.frames.length} stored / ${session.totalFrames} counted frames.'}',
+              style: const TextStyle(
+                color: AppTheme.textSecondary,
+                fontSize: 12,
+              ),
+            ),
             if (_isComparing && _compareData != null) ...[
               const SizedBox(height: 12),
               _buildComparisonPanel(),
@@ -290,7 +269,12 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
               left: ErrorTypeDistributionChart(
                 errorStats: _data.errorStats,
                 height: 150,
-                onSliceTap: (type) => showErrorTypeDetailsSheet(context, widget.session, type, builder: _builder),
+                onSliceTap: (type) => showErrorTypeDetailsSheet(
+                  context,
+                  _session,
+                  type,
+                  builder: _builder,
+                ),
               ),
               right: ErrorOverTimeChart(points: _data.errorsOverTime),
             ),
@@ -320,6 +304,18 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
     );
   }
 
+  String _originDescription() {
+    final counts = <String, int>{};
+    for (final frame in _exportSession.frames) {
+      for (final error in recordedFrameErrors(frame)) {
+        counts[error.origin.name] = (counts[error.origin.name] ?? 0) + 1;
+      }
+    }
+    return counts.isEmpty
+        ? 'none'
+        : counts.entries.map((e) => '${e.key}: ${e.value}').join(', ');
+  }
+
   Widget _buildHeader(CanSessionSummary summary) {
     return Container(
       padding: const EdgeInsets.all(16),
@@ -328,25 +324,47 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.white12),
       ),
-      child: Row(
+      child: Flex(
+        direction: MediaQuery.sizeOf(context).width < 600
+            ? Axis.vertical
+            : Axis.horizontal,
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Container(
             padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(gradient: _getSeverityGradient(summary.severity), shape: BoxShape.circle),
+            decoration: BoxDecoration(
+              gradient: _getSeverityGradient(summary.severity),
+              shape: BoxShape.circle,
+            ),
             child: const Icon(Icons.analytics, color: Colors.white, size: 22),
           ),
           const SizedBox(width: 12),
-          Expanded(
+          Flexible(
+            flex: MediaQuery.sizeOf(context).width < 600 ? 0 : 1,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(summary.sessionName, style: const TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold)),
+                Text(
+                  summary.sessionName,
+                  style: const TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
                 const SizedBox(height: 4),
-                Text('${summary.duration.toString().split('.').first} • ${summary.totalFrames} frames • ${summary.errorRate.toStringAsFixed(1)}% errors', style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12)),
+                Text(
+                  '${summary.duration.toString().split('.').first} • ${summary.totalFrames} frames • ${summary.errorRate.toStringAsFixed(1)}% errors',
+                  style: const TextStyle(
+                    color: AppTheme.textSecondary,
+                    fontSize: 12,
+                  ),
+                ),
               ],
             ),
           ),
           Flexible(
+            flex: MediaQuery.sizeOf(context).width < 600 ? 0 : 1,
             child: Wrap(
               alignment: WrapAlignment.end,
               crossAxisAlignment: WrapCrossAlignment.center,
@@ -354,15 +372,26 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
               runSpacing: 6,
               children: [
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
                   decoration: BoxDecoration(
                     color: _getSeverityColor(summary.severity).withOpacity(0.1),
                     borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: _getSeverityColor(summary.severity).withOpacity(0.3)),
+                    border: Border.all(
+                      color: _getSeverityColor(
+                        summary.severity,
+                      ).withOpacity(0.3),
+                    ),
                   ),
                   child: Text(
                     summary.severity.displayName,
-                    style: TextStyle(color: _getSeverityColor(summary.severity), fontWeight: FontWeight.bold, fontSize: 12),
+                    style: TextStyle(
+                      color: _getSeverityColor(summary.severity),
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
                   ),
                 ),
                 ElevatedButton.icon(
@@ -391,23 +420,27 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
                   },
                   icon: const Icon(Icons.filter_list),
                   label: const Text('Filters'),
-                  style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primaryOrange),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppTheme.primaryOrange,
+                  ),
                 ),
                 ElevatedButton.icon(
-                  onPressed: _exportCsv,
+                  onPressed: _exporting ? null : _exportCsv,
                   icon: const Icon(Icons.file_download),
                   label: const Text('Export CSV'),
                 ),
                 ElevatedButton.icon(
-                  onPressed: _exportJson,
+                  onPressed: _exporting ? null : _exportJson,
                   icon: const Icon(Icons.data_object),
                   label: const Text('Export JSON'),
                 ),
                 ElevatedButton.icon(
-                  onPressed: _exportPdf,
+                  onPressed: _exporting ? null : _exportPdf,
                   icon: const Icon(Icons.picture_as_pdf),
                   label: const Text('Export PDF'),
-                  style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentGreen),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppTheme.accentGreen,
+                  ),
                 ),
                 ElevatedButton.icon(
                   onPressed: _importSession,
@@ -422,12 +455,16 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
                 ElevatedButton.icon(
                   onPressed: _summary.hasReplayableData
                       ? () => Navigator.of(context).push(
-                            MaterialPageRoute(builder: (_) => ReplayScreen(session: widget.session)),
-                          )
+                          MaterialPageRoute(
+                            builder: (_) => ReplayScreen(session: _session),
+                          ),
+                        )
                       : null,
                   icon: const Icon(Icons.play_circle_outline),
                   label: const Text('Replay'),
-                  style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primaryAmber),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppTheme.primaryAmber,
+                  ),
                 ),
               ],
             ),
@@ -448,12 +485,24 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              const Icon(Icons.summarize, color: AppTheme.primaryAmber, size: 20),
+              const Icon(
+                Icons.summarize,
+                color: AppTheme.primaryAmber,
+                size: 20,
+              ),
               const SizedBox(width: 8),
-              const Text('Session Summary', style: TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold)),
-              const Spacer(),
+              const Text(
+                'Session Summary',
+                style: TextStyle(
+                  color: AppTheme.textPrimary,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
               _summaryChip('Health ${summary.healthScore}/100'),
               const SizedBox(width: 8),
               _summaryChip(summary.severity.displayName),
@@ -472,13 +521,34 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
               _summaryStat('Errors', summary.errorDetectedEvents.toString()),
               _summaryStat('Diagnostics', summary.diagnosticEvents.toString()),
               _summaryStat('Reconnects', summary.reconnectCount.toString()),
-              _summaryStat('Stats Snapshots', summary.statsSnapshotsCount.toString()),
-              _summaryStat('Duration', summary.duration.toString().split('.').first),
-              _summaryStat('Error Rate', '${summary.errorRate.toStringAsFixed(1)}%'),
-              _summaryStat('TEC', summary.latestTxErrorCounter?.toString() ?? 'n/a'),
-              _summaryStat('REC', summary.latestRxErrorCounter?.toString() ?? 'n/a'),
-              _summaryStat('RX Total', summary.latestRxTotal?.toString() ?? 'n/a'),
-              _summaryStat('Bus Errors', summary.latestBusErrorCount?.toString() ?? 'n/a'),
+              _summaryStat(
+                'Stats Snapshots',
+                summary.statsSnapshotsCount.toString(),
+              ),
+              _summaryStat(
+                'Duration',
+                summary.duration.toString().split('.').first,
+              ),
+              _summaryStat(
+                'Error Rate',
+                '${summary.errorRate.toStringAsFixed(1)}%',
+              ),
+              _summaryStat(
+                'TEC',
+                summary.latestTxErrorCounter?.toString() ?? 'n/a',
+              ),
+              _summaryStat(
+                'REC',
+                summary.latestRxErrorCounter?.toString() ?? 'n/a',
+              ),
+              _summaryStat(
+                'RX Total',
+                summary.latestRxTotal?.toString() ?? 'n/a',
+              ),
+              _summaryStat(
+                'Bus Errors',
+                summary.latestBusErrorCount?.toString() ?? 'n/a',
+              ),
             ],
           ),
           const SizedBox(height: 12),
@@ -496,13 +566,22 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
           ),
           if (summary.topCanIds.isNotEmpty) ...[
             const SizedBox(height: 12),
-            const Text('Top CAN IDs', style: TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold)),
+            const Text(
+              'Top CAN IDs',
+              style: TextStyle(
+                color: AppTheme.textPrimary,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
             const SizedBox(height: 6),
             Wrap(
               spacing: 8,
               runSpacing: 8,
               children: summary.topCanIds
-                  .map((entry) => _summaryChip('${entry.formattedId} • ${entry.count}'))
+                  .map(
+                    (entry) =>
+                        _summaryChip('${entry.formattedId} • ${entry.count}'),
+                  )
                   .toList(),
             ),
           ],
@@ -523,9 +602,18 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Text(label, style: const TextStyle(color: AppTheme.textSecondary, fontSize: 11)),
+          Text(
+            label,
+            style: const TextStyle(color: AppTheme.textSecondary, fontSize: 11),
+          ),
           const SizedBox(height: 4),
-          Text(value, style: const TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.w600)),
+          Text(
+            value,
+            style: const TextStyle(
+              color: AppTheme.textPrimary,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
         ],
       ),
     );
@@ -537,17 +625,30 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
       decoration: BoxDecoration(
         color: AppTheme.primaryOrange.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: AppTheme.primaryOrange.withValues(alpha: 0.3)),
+        border: Border.all(
+          color: AppTheme.primaryOrange.withValues(alpha: 0.3),
+        ),
       ),
-      child: Text(text, style: const TextStyle(color: AppTheme.primaryOrange, fontSize: 11, fontWeight: FontWeight.w600)),
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: AppTheme.primaryOrange,
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
     );
   }
 
   void _openComparePicker() async {
     final svc = CanSessionService.instance;
-    final sessions = svc.savedSessions.where((s) => s.id != widget.session.id).toList();
+    final sessions = svc.savedSessions
+        .where((s) => s.id != _session.id)
+        .toList();
     if (sessions.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No other sessions available to compare')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No other sessions available to compare')),
+      );
       return;
     }
 
@@ -555,11 +656,17 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
       context: context,
       builder: (c) => ListView(
         shrinkWrap: true,
-        children: sessions.map((s) => ListTile(
-          title: Text(s.name),
-          subtitle: Text('${s.formattedDuration} • ${s.totalFrames} frames • ${s.errorRate.toStringAsFixed(1)}%'),
-          onTap: () => Navigator.of(c).pop(s),
-        )).toList(),
+        children: sessions
+            .map(
+              (s) => ListTile(
+                title: Text(s.name),
+                subtitle: Text(
+                  '${s.formattedDuration} • ${s.totalFrames} frames • ${s.errorRate.toStringAsFixed(1)}%',
+                ),
+                onTap: () => Navigator.of(c).pop(s),
+              ),
+            )
+            .toList(),
       ),
     );
 
@@ -568,7 +675,18 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
     }
   }
 
-  void _startComparison(CanSession other) {
+  void _startComparison(CanSession other) async {
+    try {
+      other = await CanSessionService.instance.readStoredSession(other);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Comparison read failed: $e')));
+      }
+      return;
+    }
+    if (!mounted) return;
     final otherData = _builder.build(other);
     setState(() {
       _compareSession = other;
@@ -587,17 +705,21 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
       int importedCount = 0;
       final svc = CanSessionService.instance;
       for (final xf in files) {
-        final content = await File(xf.path).readAsString();
+        final content = await xf.readAsString();
         final decoded = jsonDecode(content);
 
         if (decoded is Map<String, dynamic>) {
-          final session = CanSession.fromJson(decoded);
+          final session = CanSession.fromJson(
+            Map<String, dynamic>.from(decoded['session'] as Map? ?? decoded),
+          );
           await svc.addImportedSession(session);
           importedCount++;
         } else if (decoded is List) {
           for (final item in decoded) {
             if (item is Map<String, dynamic>) {
-              final session = CanSession.fromJson(item);
+              final session = CanSession.fromJson(
+                Map<String, dynamic>.from(item['session'] as Map? ?? item),
+              );
               await svc.addImportedSession(session);
               importedCount++;
             }
@@ -605,12 +727,20 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
         }
       }
       if (importedCount > 0) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Imported $importedCount session(s)')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Imported $importedCount session(s)')),
+        );
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No valid sessions found in selected files')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No valid sessions found in selected files'),
+          ),
+        );
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Import failed: $e')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Import failed: $e')));
     }
   }
 
@@ -618,69 +748,162 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
     if (_compareData == null) return const SizedBox.shrink();
     final base = _data;
     final other = _compareData!;
-    final comparison = _comparisonBuilder.build(widget.session, _compareSession!);
+    final comparison = _comparisonBuilder.build(_session, _compareSession!);
     final thisSummary = comparison.thisSummary;
     final otherSummary = comparison.otherSummary;
 
-  // compute simple deltas on main counts (used in rows below if needed)
+    // compute simple deltas on main counts (used in rows below if needed)
 
     Widget _metricRow(String label, String a, String b) {
       final ad = double.tryParse(a.replaceAll('%', '')) ?? 0.0;
       final bd = double.tryParse(b.replaceAll('%', '')) ?? 0.0;
       final delta = bd - ad;
-      final deltaText = delta >= 0 ? '+${delta.toStringAsFixed(1)}' : delta.toStringAsFixed(1);
-      return Row(children: [Expanded(child: Text(label)), Text(a), const SizedBox(width: 12), Text(b), const SizedBox(width: 12), Text(deltaText)]);
+      final deltaText = delta >= 0
+          ? '+${delta.toStringAsFixed(1)}'
+          : delta.toStringAsFixed(1);
+      return Row(
+        children: [
+          Expanded(child: Text(label)),
+          Text(a),
+          const SizedBox(width: 12),
+          Text(b),
+          const SizedBox(width: 12),
+          Text(deltaText),
+        ],
+      );
     }
 
     return Container(
       padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(color: AppTheme.darkContainer, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.white12)),
+      decoration: BoxDecoration(
+        color: AppTheme.darkContainer,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white12),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(children: [
-            Expanded(child: Text('Comparing with: ${_compareSession!.name}', style: const TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold))),
-            TextButton(onPressed: () => setState(() { _isComparing = false; _compareSession = null; _compareData = null; }), child: const Text('Clear'))
-          ]),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Comparing with: ${_compareSession!.name}',
+                  style: const TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: () => setState(() {
+                  _isComparing = false;
+                  _compareSession = null;
+                  _compareData = null;
+                }),
+                child: const Text('Clear'),
+              ),
+            ],
+          ),
           const SizedBox(height: 8),
           // Summary metrics
-          Row(children: [Expanded(child: Text('Metric')), const SizedBox(width: 8), Text('This'), const SizedBox(width: 12), Text('Other'), const SizedBox(width: 12), Text('Δ')]),
+          Row(
+            children: [
+              Expanded(child: Text('Metric')),
+              const SizedBox(width: 8),
+              Text('This'),
+              const SizedBox(width: 12),
+              Text('Other'),
+              const SizedBox(width: 12),
+              Text('Δ'),
+            ],
+          ),
           const Divider(),
-          _metricRow('Total frames', '${thisSummary.totalFrames}', '${otherSummary.totalFrames}'),
+          _metricRow(
+            'Total frames',
+            '${thisSummary.totalFrames}',
+            '${otherSummary.totalFrames}',
+          ),
           const SizedBox(height: 6),
-          _metricRow('Error frames', '${thisSummary.errorFrames}', '${otherSummary.errorFrames}'),
+          _metricRow(
+            'Error frames',
+            '${thisSummary.errorFrames}',
+            '${otherSummary.errorFrames}',
+          ),
           const SizedBox(height: 6),
-          _metricRow('Error rate', '${thisSummary.errorRate.toStringAsFixed(2)}%', '${otherSummary.errorRate.toStringAsFixed(2)}%'),
+          _metricRow(
+            'Error rate',
+            '${thisSummary.errorRate.toStringAsFixed(2)}%',
+            '${otherSummary.errorRate.toStringAsFixed(2)}%',
+          ),
           const SizedBox(height: 6),
-          _metricRow('Health score', '${thisSummary.healthScore}', '${otherSummary.healthScore}'),
+          _metricRow(
+            'Health score',
+            '${thisSummary.healthScore}',
+            '${otherSummary.healthScore}',
+          ),
           const SizedBox(height: 6),
-          _metricRow('Reconnects', '${thisSummary.reconnectCount}', '${otherSummary.reconnectCount}'),
+          _metricRow(
+            'Reconnects',
+            '${thisSummary.reconnectCount}',
+            '${otherSummary.reconnectCount}',
+          ),
           const SizedBox(height: 12),
           SizedBox(
             height: 120,
             child: CustomPaint(
-              painter: _CombinedErrorOverTimePainter(base.errorsOverTime, other.errorsOverTime),
+              painter: _CombinedErrorOverTimePainter(
+                base.errorsOverTime,
+                other.errorsOverTime,
+              ),
               size: Size(double.infinity, 120),
             ),
           ),
           if (comparison.idComparisons.isNotEmpty) ...[
             const SizedBox(height: 12),
-            const Text('Changed CAN IDs', style: TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold)),
+            const Text(
+              'Changed CAN IDs',
+              style: TextStyle(
+                color: AppTheme.textPrimary,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
             const SizedBox(height: 6),
             ...comparison.idComparisons.take(8).map((entry) {
               final delta = entry.delta;
-              final color = delta > 0 ? AppTheme.accentRed : AppTheme.accentGreen;
+              final color = delta > 0
+                  ? AppTheme.accentRed
+                  : AppTheme.accentGreen;
               final deltaText = delta > 0 ? '+$delta' : '$delta';
               return Padding(
                 padding: const EdgeInsets.symmetric(vertical: 2),
                 child: Row(
                   children: [
-                    Expanded(child: Text(entry.formattedId, style: const TextStyle(color: AppTheme.textSecondary, fontFamily: 'monospace'))),
-                    Text('${entry.thisCount}', style: const TextStyle(color: AppTheme.textSecondary)),
+                    Expanded(
+                      child: Text(
+                        entry.formattedId,
+                        style: const TextStyle(
+                          color: AppTheme.textSecondary,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ),
+                    Text(
+                      '${entry.thisCount}',
+                      style: const TextStyle(color: AppTheme.textSecondary),
+                    ),
                     const SizedBox(width: 12),
-                    Text('${entry.otherCount}', style: const TextStyle(color: AppTheme.textSecondary)),
+                    Text(
+                      '${entry.otherCount}',
+                      style: const TextStyle(color: AppTheme.textSecondary),
+                    ),
                     const SizedBox(width: 12),
-                    Text(deltaText, style: TextStyle(color: color, fontWeight: FontWeight.bold)),
+                    Text(
+                      deltaText,
+                      style: TextStyle(
+                        color: color,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                   ],
                 ),
               );
@@ -699,7 +922,11 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
 
     return Container(
       padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(color: AppTheme.darkContainer, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.white12)),
+      decoration: BoxDecoration(
+        color: AppTheme.darkContainer,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white12),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -707,30 +934,50 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
             children: [
               Icon(Icons.lightbulb, color: AppTheme.primaryOrange),
               SizedBox(width: 8),
-              Text('Recommendations', style: TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold)),
+              Expanded(
+                child: Text(
+                  'Recommendations',
+                  style: TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 8),
-          ...recs.map((r) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4),
-                child: Row(
-                  children: [
-                    const Icon(Icons.check, color: AppTheme.accentGreen, size: 16),
-                    const SizedBox(width: 8),
-                    Expanded(child: Text(r, style: const TextStyle(color: AppTheme.textSecondary))),
-                  ],
-                ),
-              )),
+          ...recs.map(
+            (r) => Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.check,
+                    color: AppTheme.accentGreen,
+                    size: 16,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      r,
+                      style: const TextStyle(color: AppTheme.textSecondary),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
   }
 
   Widget _buildDiagnosticEvents() {
-    final events = widget.session.events
-        .where((event) => event.type == CanSessionEventType.diagnostic)
-        .toList()
-      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    final events =
+        _session.events
+            .where((event) => event.type == CanSessionEventType.diagnostic)
+            .toList()
+          ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
     if (events.isEmpty) return const SizedBox.shrink();
 
     return Container(
@@ -747,7 +994,15 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
             children: [
               Icon(Icons.warning_amber, color: AppTheme.primaryAmber),
               SizedBox(width: 8),
-              Text('Diagnostic Events', style: TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold)),
+              Expanded(
+                child: Text(
+                  'Diagnostic Events',
+                  style: TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 10),
@@ -772,19 +1027,43 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
         children: [
           Row(
             children: [
-              Expanded(child: Text(event.message, style: TextStyle(color: color, fontWeight: FontWeight.bold))),
-              Text(event.diagnosticSeverity.name.toUpperCase(), style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.bold)),
+              Expanded(
+                child: Text(
+                  event.message,
+                  style: TextStyle(color: color, fontWeight: FontWeight.bold),
+                ),
+              ),
+              Text(
+                event.diagnosticSeverity.name.toUpperCase(),
+                style: TextStyle(
+                  color: color,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 4),
-          Text('${event.timestamp.toIso8601String()} • cause: ${event.diagnosticCause.name}', style: const TextStyle(color: AppTheme.textMuted, fontSize: 11)),
+          Text(
+            '${event.timestamp.toIso8601String()} • cause: ${event.diagnosticCause.name} | evidence: ${event.evidence.name}',
+            style: const TextStyle(color: AppTheme.textMuted, fontSize: 11),
+          ),
           if (event.explanation != null) ...[
             const SizedBox(height: 6),
-            Text(event.explanation!, style: const TextStyle(color: AppTheme.textSecondary)),
+            Text(
+              event.explanation!,
+              style: const TextStyle(color: AppTheme.textSecondary),
+            ),
           ],
           if (event.recommendation != null) ...[
             const SizedBox(height: 4),
-            Text('Action: ${event.recommendation}', style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12)),
+            Text(
+              'Action: ${event.recommendation}',
+              style: const TextStyle(
+                color: AppTheme.textSecondary,
+                fontSize: 12,
+              ),
+            ),
           ],
         ],
       ),
@@ -814,16 +1093,34 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
       runSpacing: 8,
       children: entries.map((e) {
         return GestureDetector(
-          onTap: () => showErrorTypeDetailsSheet(context, widget.session, e.key, builder: _builder),
+          onTap: () => showErrorTypeDetailsSheet(
+            context,
+            _session,
+            e.key,
+            builder: _builder,
+          ),
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(color: AppTheme.darkContainer, borderRadius: BorderRadius.circular(20), border: Border.all(color: Colors.white12)),
+            decoration: BoxDecoration(
+              color: AppTheme.darkContainer,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: Colors.white12),
+            ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Icon(Icons.error_outline, color: AppTheme.primaryOrange, size: 16),
+                const Icon(
+                  Icons.error_outline,
+                  color: AppTheme.primaryOrange,
+                  size: 16,
+                ),
                 const SizedBox(width: 6),
-                Text('${_label(e.key)} • ${e.value}', style: const TextStyle(color: AppTheme.textPrimary)),
+                Flexible(
+                  child: Text(
+                    '${_label(e.key)} • ${e.value}',
+                    style: const TextStyle(color: AppTheme.textPrimary),
+                  ),
+                ),
               ],
             ),
           ),
@@ -854,15 +1151,25 @@ class _SessionAnalyticsDetailScreenState extends State<SessionAnalyticsDetailScr
   LinearGradient _getSeverityGradient(SessionSeverity severity) {
     switch (severity) {
       case SessionSeverity.critical:
-        return const LinearGradient(colors: [AppTheme.accentRed, Color(0xFFD32F2F)]);
+        return const LinearGradient(
+          colors: [AppTheme.accentRed, Color(0xFFD32F2F)],
+        );
       case SessionSeverity.high:
-        return const LinearGradient(colors: [Color(0xFFFF9800), AppTheme.accentRed]);
+        return const LinearGradient(
+          colors: [Color(0xFFFF9800), AppTheme.accentRed],
+        );
       case SessionSeverity.medium:
-        return const LinearGradient(colors: [AppTheme.primaryOrange, Color(0xFFFF9800)]);
+        return const LinearGradient(
+          colors: [AppTheme.primaryOrange, Color(0xFFFF9800)],
+        );
       case SessionSeverity.low:
-        return const LinearGradient(colors: [AppTheme.primaryAmber, AppTheme.primaryOrange]);
+        return const LinearGradient(
+          colors: [AppTheme.primaryAmber, AppTheme.primaryOrange],
+        );
       case SessionSeverity.normal:
-        return const LinearGradient(colors: [AppTheme.accentGreen, Color(0xFF66BB6A)]);
+        return const LinearGradient(
+          colors: [AppTheme.accentGreen, Color(0xFF66BB6A)],
+        );
     }
   }
 
@@ -914,8 +1221,14 @@ class _CombinedErrorOverTimePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paintA = Paint()..color = AppTheme.primaryAmber..strokeWidth = 2..style = PaintingStyle.stroke;
-    final paintB = Paint()..color = AppTheme.accentRed..strokeWidth = 2..style = PaintingStyle.stroke;
+    final paintA = Paint()
+      ..color = AppTheme.primaryAmber
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+    final paintB = Paint()
+      ..color = AppTheme.accentRed
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
 
     final maxCount = [
       if (a.isNotEmpty) a.map((p) => p.count).reduce((x, y) => x > y ? x : y),
@@ -940,11 +1253,15 @@ class _CombinedErrorOverTimePainter extends CustomPainter {
     }
 
     final pathA = Path()..moveTo(pointsA.first.dx, pointsA.first.dy);
-    for (int i = 1; i < pointsA.length; i++) pathA.lineTo(pointsA[i].dx, pointsA[i].dy);
+    for (int i = 1; i < pointsA.length; i++) {
+      pathA.lineTo(pointsA[i].dx, pointsA[i].dy);
+    }
     canvas.drawPath(pathA, paintA);
 
     final pathB = Path()..moveTo(pointsB.first.dx, pointsB.first.dy);
-    for (int i = 1; i < pointsB.length; i++) pathB.lineTo(pointsB[i].dx, pointsB[i].dy);
+    for (int i = 1; i < pointsB.length; i++) {
+      pathB.lineTo(pointsB[i].dx, pointsB[i].dy);
+    }
     canvas.drawPath(pathB, paintB);
   }
 
@@ -959,7 +1276,14 @@ class _FilterDialog extends StatefulWidget {
   final int? idMax;
   final Set<CanErrorType> selectedTypes;
   final int minSeverity;
-  final void Function(DateTimeRange? range, int? idMin, int? idMax, Set<CanErrorType> types, int minSeverity) onApply;
+  final void Function(
+    DateTimeRange? range,
+    int? idMin,
+    int? idMax,
+    Set<CanErrorType> types,
+    int minSeverity,
+  )
+  onApply;
 
   const _FilterDialog({
     required this.initialRange,
@@ -1002,55 +1326,125 @@ class _FilterDialogState extends State<_FilterDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: AppTheme.darkSurface,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: BorderSide(color: AppTheme.primaryOrange.withOpacity(0.3))),
-      title: const Text('Filters', style: TextStyle(color: AppTheme.textPrimary)),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(color: AppTheme.primaryOrange.withOpacity(0.3)),
+      ),
+      title: const Text(
+        'Filters',
+        style: TextStyle(color: AppTheme.textPrimary),
+      ),
       content: SingleChildScrollView(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Time range', style: TextStyle(color: AppTheme.textSecondary)),
+            const Text(
+              'Time range',
+              style: TextStyle(color: AppTheme.textSecondary),
+            ),
             const SizedBox(height: 8),
-            Row(children: [
-              ElevatedButton(
-                onPressed: () async {
-                  final picked = await showDateRangePicker(context: context, firstDate: DateTime(2000), lastDate: DateTime.now(), initialDateRange: _range);
-                  if (picked != null) setState(() => _range = picked);
-                },
-                child: Text(_range == null ? 'Select range' : '${_range!.start.toLocal()} - ${_range!.end.toLocal()}'),
-              ),
-              const SizedBox(width: 8),
-              TextButton(onPressed: () => setState(() => _range = null), child: const Text('Clear')),
-            ]),
+            Row(
+              children: [
+                ElevatedButton(
+                  onPressed: () async {
+                    final picked = await showDateRangePicker(
+                      context: context,
+                      firstDate: DateTime(2000),
+                      lastDate: DateTime.now(),
+                      initialDateRange: _range,
+                    );
+                    if (picked != null) setState(() => _range = picked);
+                  },
+                  child: Text(
+                    _range == null
+                        ? 'Select range'
+                        : '${_range!.start.toLocal()} - ${_range!.end.toLocal()}',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: () => setState(() => _range = null),
+                  child: const Text('Clear'),
+                ),
+              ],
+            ),
             const SizedBox(height: 12),
 
-            const Text('CAN ID range', style: TextStyle(color: AppTheme.textSecondary)),
+            const Text(
+              'CAN ID range',
+              style: TextStyle(color: AppTheme.textSecondary),
+            ),
             const SizedBox(height: 8),
-            Row(children: [
-              Flexible(child: TextField(controller: _idMinCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(hintText: 'Min ID'))),
-              const SizedBox(width: 8),
-              Flexible(child: TextField(controller: _idMaxCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(hintText: 'Max ID'))),
-            ]),
+            Row(
+              children: [
+                Flexible(
+                  child: TextField(
+                    controller: _idMinCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(hintText: 'Min ID'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: TextField(
+                    controller: _idMaxCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(hintText: 'Max ID'),
+                  ),
+                ),
+              ],
+            ),
             const SizedBox(height: 12),
 
-            const Text('Error types', style: TextStyle(color: AppTheme.textSecondary)),
+            const Text(
+              'Error types',
+              style: TextStyle(color: AppTheme.textSecondary),
+            ),
             const SizedBox(height: 8),
-            Wrap(spacing: 8, children: CanErrorType.values.where((t) => t != CanErrorType.none).map((t) {
-              final label = t.toString().split('.').last;
-              final selected = _types.contains(t);
-              return FilterChip(label: Text(label), selected: selected, onSelected: (v) => setState(() => v ? _types.add(t) : _types.remove(t)));
-            }).toList()),
+            Wrap(
+              spacing: 8,
+              children: CanErrorType.values
+                  .where((t) => t != CanErrorType.none)
+                  .map((t) {
+                    final label = t.toString().split('.').last;
+                    final selected = _types.contains(t);
+                    return FilterChip(
+                      label: Text(label),
+                      selected: selected,
+                      onSelected: (v) =>
+                          setState(() => v ? _types.add(t) : _types.remove(t)),
+                    );
+                  })
+                  .toList(),
+            ),
             const SizedBox(height: 12),
 
-            const Text('Minimum severity', style: TextStyle(color: AppTheme.textSecondary)),
+            const Text(
+              'Minimum severity',
+              style: TextStyle(color: AppTheme.textSecondary),
+            ),
             const SizedBox(height: 8),
-            DropdownButton<int>(value: _minSeverity, items: [1,2,3,4,5].map((v) => DropdownMenuItem(value: v, child: Text('$v'))).toList(), onChanged: (v) { if (v!=null) setState(()=>_minSeverity=v); }),
+            DropdownButton<int>(
+              value: _minSeverity,
+              items: [1, 2, 3, 4, 5]
+                  .map((v) => DropdownMenuItem(value: v, child: Text('$v')))
+                  .toList(),
+              onChanged: (v) {
+                if (v != null) setState(() => _minSeverity = v);
+              },
+            ),
           ],
         ),
       ),
       actions: [
-        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
         ElevatedButton(
-          style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primaryAmber),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppTheme.primaryAmber,
+          ),
           onPressed: () {
             final minId = int.tryParse(_idMinCtrl.text);
             final maxId = int.tryParse(_idMaxCtrl.text);

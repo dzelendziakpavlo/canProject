@@ -4,15 +4,15 @@ import '../models/can_frame.dart';
 /// Types of CAN errors that can be detected
 enum CanErrorType {
   none,
-  crcError,        // CRC checksum mismatch
-  formatError,     // Frame format violation
-  stuffingError,   // Bit stuffing violation
-  ackError,        // Acknowledgment error
-  overloadError,   // Bus overload condition
-  formError,       // Form error in fixed format bits
-  activeError,     // Active error flag detected
-  passiveError,    // Passive error flag detected
-  busOffError,     // Bus-off condition
+  crcError, // CRC checksum mismatch
+  formatError, // Frame format violation
+  stuffingError, // Bit stuffing violation
+  ackError, // Acknowledgment error
+  overloadError, // Bus overload condition
+  formError, // Form error in fixed format bits
+  activeError, // Active error flag detected
+  passiveError, // Passive error flag detected
+  busOffError, // Bus-off condition
 }
 
 enum CanErrorOrigin { hardware, inferred, simulated }
@@ -37,56 +37,81 @@ class CanErrorInfo {
 
   String get severityText {
     switch (severity) {
-      case 1: return 'Low';
-      case 2: return 'Medium';
-      case 3: return 'High';
-      case 4: return 'Critical';
-      case 5: return 'Fatal';
-      default: return 'Unknown';
+      case 1:
+        return 'Low';
+      case 2:
+        return 'Medium';
+      case 3:
+        return 'High';
+      case 4:
+        return 'Critical';
+      case 5:
+        return 'Fatal';
+      default:
+        return 'Unknown';
     }
   }
 
   String get typeText => type.toString().split('.').last;
 
   Map<String, dynamic> toJson() => {
-        'type': type.name,
-        'description': description,
-        'severity': severity,
-        'origin': origin.name,
-        'timestamp': timestamp.toIso8601String(),
-        'details': details,
-      };
+    'type': type.name,
+    'description': description,
+    'severity': severity,
+    'origin': origin.name,
+    'timestamp': timestamp.toIso8601String(),
+    'details': details,
+  };
+
+  // Older telemetry markers sometimes claimed an exact protocol subtype from
+  // buserr alone. Keep their original label as metadata, without validating it.
+  static bool _unverifiedHardware(Map<String, dynamic> json) =>
+      json['origin'] == 'hardware' &&
+      const {
+        'crcError',
+        'ackError',
+        'stuffingError',
+        'formError',
+        'formatError',
+      }.contains(json['type']) &&
+      (json['details'] as Map?)?['evidenceSource'] != 'wire_error_capture';
 
   factory CanErrorInfo.fromJson(Map<String, dynamic> json) => CanErrorInfo(
-        type: CanErrorType.values.firstWhere(
-          (value) => value.name == json['type'],
-          orElse: () => CanErrorType.none,
-        ),
-        description: json['description'] as String? ?? '',
-        severity: (json['severity'] as num?)?.toInt() ?? 1,
-        origin: CanErrorOrigin.values.firstWhere(
-          (value) => value.name == json['origin'],
-          orElse: () => CanErrorOrigin.inferred,
-        ),
-        timestamp: json['timestamp'] == null
-            ? null
-            : DateTime.tryParse(json['timestamp'].toString()),
-        details: (json['details'] as Map?)?.map(
-              (key, value) => MapEntry(key.toString(), value),
-            ) ??
-            const {},
-      );
+    type: CanErrorType.values.firstWhere(
+      (value) => value.name == json['type'],
+      orElse: () => CanErrorType.none,
+    ),
+    description: json['description'] as String? ?? '',
+    severity: (json['severity'] as num?)?.toInt() ?? 1,
+    origin: _unverifiedHardware(json)
+        ? CanErrorOrigin.inferred
+        : CanErrorOrigin.values.firstWhere(
+            (value) => value.name == json['origin'],
+            orElse: () => CanErrorOrigin.inferred,
+          ),
+    timestamp: json['timestamp'] == null
+        ? null
+        : DateTime.tryParse(json['timestamp'].toString()),
+    details: {
+      ...?(json['details'] as Map?)?.map(
+        (key, value) => MapEntry(key.toString(), value),
+      ),
+      if (_unverifiedHardware(json)) ...{
+        'originalOrigin': 'hardware',
+        'evidenceVerified': false,
+      },
+    },
+  );
 }
 
 /// CAN Error Checker for detecting and analyzing frame errors
 class CanErrorChecker {
-  
   // Error simulation rates (configurable)
-  static const double stuffingErrorRate = 0.02;    // 2%
-  static const double formatErrorRate = 0.015;     // 1.5%
-  static const double ackErrorRate = 0.01;         // 1%
-  static const double overloadErrorRate = 0.005;   // 0.5%
-  static const double formErrorRate = 0.008;       // 0.8%
+  static const double stuffingErrorRate = 0.02; // 2%
+  static const double formatErrorRate = 0.015; // 1.5%
+  static const double ackErrorRate = 0.01; // 1%
+  static const double overloadErrorRate = 0.005; // 0.5%
+  static const double formErrorRate = 0.008; // 0.8%
 
   /// Check if a CAN frame has any errors
   bool hasError(CanFrame frame) {
@@ -99,17 +124,19 @@ class CanErrorChecker {
     final errors = <CanErrorInfo>[];
 
     if (frame.isCorrupted) {
-      errors.add(CanErrorInfo(
-        type: CanErrorType.crcError,
-        description: 'Виявлено невідповідність контрольної суми CRC',
-        severity: 3,
-        origin: CanErrorOrigin.simulated,
-        details: {
-          'frameId': frame.id,
-          'expectedCrc': _calculateExpectedCrc(frame),
-          'actualCrc': frame.crc,
-        },
-      ));
+      errors.add(
+        CanErrorInfo(
+          type: CanErrorType.crcError,
+          description: 'Виявлено невідповідність контрольної суми CRC',
+          severity: 3,
+          origin: CanErrorOrigin.simulated,
+          details: {
+            'frameId': frame.id,
+            'expectedCrc': _calculateExpectedCrc(frame),
+            'actualCrc': frame.crc,
+          },
+        ),
+      );
     }
     errors.addAll(_simulateProtocolErrors(frame));
     return errors;
@@ -118,81 +145,96 @@ class CanErrorChecker {
   /// Simulate various protocol-level errors (deterministic based on frame properties)
   List<CanErrorInfo> _simulateProtocolErrors(CanFrame frame) {
     final errors = <CanErrorInfo>[];
-    
+
     // Create deterministic seed based on frame properties
-    final seed = frame.id ^ frame.dlc ^ frame.data.fold(0, (sum, byte) => sum ^ byte) ^ frame.timestamp.millisecondsSinceEpoch;
+    final seed =
+        frame.id ^
+        frame.dlc ^
+        frame.data.fold(0, (sum, byte) => sum ^ byte) ^
+        frame.timestamp.millisecondsSinceEpoch;
     final frameRandom = Random(seed);
 
     // Bit Stuffing Error
     if (frameRandom.nextDouble() < stuffingErrorRate) {
-      errors.add(CanErrorInfo(
-        type: CanErrorType.stuffingError,
-        description: 'Bit stuffing violation: More than 5 consecutive identical bits',
-        severity: 2,
-        origin: CanErrorOrigin.simulated,
-        details: {
-          'position': frameRandom.nextInt(64), // Bit position in frame
-          'sequence': _generateBadStuffingSequence(frameRandom),
-        },
-      ));
+      errors.add(
+        CanErrorInfo(
+          type: CanErrorType.stuffingError,
+          description:
+              'Bit stuffing violation: More than 5 consecutive identical bits',
+          severity: 2,
+          origin: CanErrorOrigin.simulated,
+          details: {
+            'position': frameRandom.nextInt(64), // Bit position in frame
+            'sequence': _generateBadStuffingSequence(frameRandom),
+          },
+        ),
+      );
     }
 
     // Format Error
     if (frameRandom.nextDouble() < formatErrorRate) {
-      errors.add(CanErrorInfo(
-        type: CanErrorType.formatError,
-        description: 'Frame format violation in reserved bits',
-        severity: 3,
-        origin: CanErrorOrigin.simulated,
-        details: {
-          'fieldType': _getRandomFormatErrorField(frameRandom),
-          'expectedValue': '0',
-          'actualValue': '1',
-        },
-      ));
+      errors.add(
+        CanErrorInfo(
+          type: CanErrorType.formatError,
+          description: 'Frame format violation in reserved bits',
+          severity: 3,
+          origin: CanErrorOrigin.simulated,
+          details: {
+            'fieldType': _getRandomFormatErrorField(frameRandom),
+            'expectedValue': '0',
+            'actualValue': '1',
+          },
+        ),
+      );
     }
 
     // ACK Error
     if (frameRandom.nextDouble() < ackErrorRate) {
-      errors.add(CanErrorInfo(
-        type: CanErrorType.ackError,
-        description: 'No acknowledgment received from any node',
-        severity: 4,
-        origin: CanErrorOrigin.simulated,
-        details: {
-          'ackSlot': 'recessive',
-          'expectedState': 'dominant',
-          'busLoad': '${frameRandom.nextInt(100)}%',
-        },
-      ));
+      errors.add(
+        CanErrorInfo(
+          type: CanErrorType.ackError,
+          description: 'No acknowledgment received from any node',
+          severity: 4,
+          origin: CanErrorOrigin.simulated,
+          details: {
+            'ackSlot': 'recessive',
+            'expectedState': 'dominant',
+            'busLoad': '${frameRandom.nextInt(100)}%',
+          },
+        ),
+      );
     }
 
     // Overload Error
     if (frameRandom.nextDouble() < overloadErrorRate) {
-      errors.add(CanErrorInfo(
-        type: CanErrorType.overloadError,
-        description: 'Bus overload condition detected',
-        severity: 4,
-        origin: CanErrorOrigin.simulated,
-        details: {
-          'overloadFlags': frameRandom.nextInt(3) + 1,
-          'cause': _getRandomOverloadCause(frameRandom),
-        },
-      ));
+      errors.add(
+        CanErrorInfo(
+          type: CanErrorType.overloadError,
+          description: 'Bus overload condition detected',
+          severity: 4,
+          origin: CanErrorOrigin.simulated,
+          details: {
+            'overloadFlags': frameRandom.nextInt(3) + 1,
+            'cause': _getRandomOverloadCause(frameRandom),
+          },
+        ),
+      );
     }
 
     // Form Error
     if (frameRandom.nextDouble() < formErrorRate) {
-      errors.add(CanErrorInfo(
-        type: CanErrorType.formError,
-        description: 'Form error in fixed format field',
-        severity: 2,
-        origin: CanErrorOrigin.simulated,
-        details: {
-          'field': _getRandomFormErrorField(frameRandom),
-          'bitPosition': frameRandom.nextInt(8),
-        },
-      ));
+      errors.add(
+        CanErrorInfo(
+          type: CanErrorType.formError,
+          description: 'Form error in fixed format field',
+          severity: 2,
+          origin: CanErrorOrigin.simulated,
+          details: {
+            'field': _getRandomFormErrorField(frameRandom),
+            'bitPosition': frameRandom.nextInt(8),
+          },
+        ),
+      );
     }
 
     return errors;
@@ -226,7 +268,7 @@ class CanErrorChecker {
       'Internal conditions',
       'External event during intermission',
       'Receiver not ready',
-      'Bus timing violation'
+      'Bus timing violation',
     ];
     return causes[random.nextInt(causes.length)];
   }
@@ -240,7 +282,7 @@ class CanErrorChecker {
   /// Get error statistics for multiple frames
   Map<CanErrorType, int> getErrorStatistics(List<CanFrame> frames) {
     final stats = <CanErrorType, int>{};
-    
+
     for (final errorType in CanErrorType.values) {
       stats[errorType] = 0;
     }
@@ -258,17 +300,20 @@ class CanErrorChecker {
   /// Check if error rate is critical
   bool isCriticalErrorRate(Map<CanErrorType, int> errorStats, int totalFrames) {
     if (totalFrames == 0) return false;
-    
+
     final totalErrors = errorStats.values.fold(0, (sum, count) => sum + count);
     final errorRate = totalErrors / totalFrames;
-    
+
     return errorRate > 0.15; // More than 15% error rate is critical
   }
 
   /// Get recommended actions based on error patterns
-  List<String> getRecommendations(Map<CanErrorType, int> errorStats, int totalFrames) {
+  List<String> getRecommendations(
+    Map<CanErrorType, int> errorStats,
+    int totalFrames,
+  ) {
     final recommendations = <String>[];
-    
+
     if (totalFrames == 0) return recommendations;
 
     final crcErrors = errorStats[CanErrorType.crcError] ?? 0;
@@ -277,11 +322,15 @@ class CanErrorChecker {
     final overloadErrors = errorStats[CanErrorType.overloadError] ?? 0;
 
     if (crcErrors / totalFrames > 0.05) {
-      recommendations.add('High CRC error rate: Check cable integrity and termination');
+      recommendations.add(
+        'High CRC error rate: Check cable integrity and termination',
+      );
     }
 
     if (stuffingErrors / totalFrames > 0.03) {
-      recommendations.add('Bit stuffing violations: Verify bus timing and clock synchronization');
+      recommendations.add(
+        'Bit stuffing violations: Verify bus timing and clock synchronization',
+      );
     }
 
     if (ackErrors / totalFrames > 0.02) {
@@ -289,7 +338,9 @@ class CanErrorChecker {
     }
 
     if (overloadErrors / totalFrames > 0.01) {
-      recommendations.add('Overload conditions: Reduce bus traffic or increase processing capacity');
+      recommendations.add(
+        'Overload conditions: Reduce bus traffic or increase processing capacity',
+      );
     }
 
     return recommendations;

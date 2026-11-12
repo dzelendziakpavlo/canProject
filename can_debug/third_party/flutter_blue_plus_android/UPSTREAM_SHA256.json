@@ -1,0 +1,42 @@
+[
+  {
+    "path": "analysis_options.yaml",
+    "sha256": "b3ca727f3726e2f86cfde99974fb8053022395ef2dce7627d54f0b872486e41e"
+  },
+  {
+    "path": "android/build.gradle",
+    "sha256": "69cd9b60eb7de7034df9429a511960b100f0a64ef32a059c06828168efcd9e19"
+  },
+  {
+    "path": "android/settings.gradle",
+    "sha256": "a82c2d0eb314b300eb5d0550cd650784d42f73f8bc4faee98d32b75e12429039"
+  },
+  {
+    "path": "android/src/main/AndroidManifest.xml",
+    "sha256": "ea6d6484b156f570b117621d1d040beda60455c37aa4ad73188fc71532d841bc"
+  },
+  {
+    "path": "android/src/main/java/com/lib/flutter_blue_plus/FlutterBluePlusPlugin.java",
+    "sha256": "c43df235d3d0f752a93672dbd3ac743dc9a056fe072500aafcdddc51b6a167e9"
+  },
+  {
+    "path": "CHANGELOG.md",
+    "sha256": "18431f8fcaff5e025bdb876c4537633b45aeceec10407bbfbcb105b81c666eee"
+  },
+  {
+    "path": "lib/flutter_blue_plus_android.dart",
+    "sha256": "6e7fb6f80a13b34f9eed8d258322937c49a67cc5b8447dbee1aed66b5728d5cc"
+  },
+  {
+    "path": "LICENSE",
+    "sha256": "5f16ae7ba59fac57275900aa4ca7dc6a136d8fe9346b5644c0c6052e8a7e6c43"
+  },
+  {
+    "path": "pubspec.yaml",
+    "sha256": "e88f3a7de25d7c86de1d47bd47f4010830344f493eb602fea0e45aba629893a9"
+  },
+  {
+    "path": "README.md",
+    "sha256": "f8f67fc8532e9cecf4559f2d76e9525905732b2bc9b7a8035d7f92b534b900ad"
+  }
+]

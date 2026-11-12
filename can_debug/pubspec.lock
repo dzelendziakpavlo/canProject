@@ -391,12 +391,11 @@ packages:
     source: hosted
     version: "1.36.8"
   flutter_blue_plus_android:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
-      name: flutter_blue_plus_android
-      sha256: "6f7fe7e69659c30af164a53730707edc16aa4d959e4c208f547b893d940f853d"
-      url: "https://pub.dev"
-    source: hosted
+      path: "third_party/flutter_blue_plus_android"
+      relative: true
+    source: path
     version: "7.0.4"
   flutter_blue_plus_darwin:
     dependency: transitive
@@ -553,7 +552,7 @@ packages:
     source: hosted
     version: "2.9.0"
   intl:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: intl
       sha256: d6f56758b7d3014a48af9701c085700aac781a92a87a62b1333b46d8879661cf

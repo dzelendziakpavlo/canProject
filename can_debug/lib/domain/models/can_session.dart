@@ -5,8 +5,9 @@ import '../detection/can_error_checker.dart';
 
 /// Модель сесії CAN моніторингу
 class CanSession {
-  static const int currentSchemaVersion = 2;
+  static const int currentSchemaVersion = 3;
 
+  final Map<String, dynamic> captureMetadata;
   final String id;
   final String name;
   final String? sourceName;
@@ -23,6 +24,7 @@ class CanSession {
   final bool isActive;
 
   const CanSession({
+    this.captureMetadata = const {},
     required this.id,
     required this.name,
     this.sourceName,
@@ -42,7 +44,7 @@ class CanSession {
   /// Створити нову активну сесію
   factory CanSession.create(String name) {
     return CanSession(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
       name: name,
       sourceName: null,
       schemaVersion: currentSchemaVersion,
@@ -60,6 +62,7 @@ class CanSession {
 
   /// Оновити сесію з новими даними
   CanSession updateWith({
+    Map<String, dynamic>? captureMetadata,
     String? sourceName,
     List<CanFrame>? frames,
     List<CanStats>? statsSnapshots,
@@ -71,6 +74,7 @@ class CanSession {
     int? schemaVersion,
   }) {
     return CanSession(
+      captureMetadata: captureMetadata ?? this.captureMetadata,
       id: id,
       name: name,
       sourceName: sourceName ?? this.sourceName,
@@ -91,6 +95,7 @@ class CanSession {
   /// Завершити сесію
   CanSession complete() {
     return CanSession(
+      captureMetadata: captureMetadata,
       id: id,
       name: name,
       sourceName: sourceName,
@@ -120,7 +125,7 @@ class CanSession {
     final hours = d.inHours;
     final minutes = (d.inMinutes % 60);
     final seconds = (d.inSeconds % 60);
-    
+
     if (hours > 0) {
       return '${hours}h ${minutes}m ${seconds}s';
     } else if (minutes > 0) {
@@ -142,6 +147,7 @@ class CanSession {
   /// Конвертація до Map для збереження
   Map<String, dynamic> toJson() {
     return {
+      'captureMetadata': captureMetadata,
       'id': id,
       'name': name,
       'sourceName': sourceName,
@@ -167,27 +173,49 @@ class CanSession {
         : int.tryParse(rawSchemaVersion?.toString() ?? '') ?? 1;
 
     return CanSession(
+      captureMetadata:
+          (json['captureMetadata'] as Map?)?.cast<String, dynamic>() ??
+          const {},
       id: json['id'],
       name: json['name'],
       sourceName: json['sourceName'] as String?,
       schemaVersion: parsedSchemaVersion,
       startTime: DateTime.parse(json['startTime']),
       endTime: json['endTime'] != null ? DateTime.parse(json['endTime']) : null,
-      frames: (json['frames'] as List?)?.map((f) => CanFrame.fromJson(f)).toList() ?? [],
-      statsSnapshots: (json['statsSnapshots'] as List?)
-          ?.map((stats) => CanStats.fromStoredJson(Map<String, dynamic>.from(stats as Map)))
-          .toList() ??
+      frames:
+          (json['frames'] as List?)
+              ?.map((f) => CanFrame.fromJson(f))
+              .toList() ??
+          [],
+      statsSnapshots:
+          (json['statsSnapshots'] as List?)
+              ?.map(
+                (stats) => CanStats.fromStoredJson(
+                  Map<String, dynamic>.from(stats as Map),
+                ),
+              )
+              .toList() ??
           const [],
-      events: (json['events'] as List?)
-          ?.map((event) => CanSessionEvent.fromJson(Map<String, dynamic>.from(event as Map)))
-          .toList() ??
+      events:
+          (json['events'] as List?)
+              ?.map(
+                (event) => CanSessionEvent.fromJson(
+                  Map<String, dynamic>.from(event as Map),
+                ),
+              )
+              .toList() ??
           const [],
-      errorStats: (json['errorStats'] as Map<String, dynamic>?)?.map(
-        (k, v) => MapEntry(
-          CanErrorType.values.firstWhere((e) => e.toString() == k),
-          v as int,
-        ),
-      ) ?? {for (var type in CanErrorType.values) type: 0},
+      errorStats:
+          (json['errorStats'] as Map<String, dynamic>?)?.map(
+            (k, v) => MapEntry(
+              CanErrorType.values.firstWhere(
+                (e) => e.toString() == k || e.name == k,
+                orElse: () => CanErrorType.none,
+              ),
+              v as int,
+            ),
+          ) ??
+          {for (var type in CanErrorType.values) type: 0},
       totalFrames: json['totalFrames'] ?? 0,
       errorFrames: json['errorFrames'] ?? 0,
       errorRate: (json['errorRate'] ?? 0.0).toDouble(),
@@ -197,13 +225,7 @@ class CanSession {
 }
 
 /// Рівні критичності сесії
-enum SessionSeverity {
-  normal,
-  low,
-  medium,
-  high,
-  critical,
-}
+enum SessionSeverity { normal, low, medium, high, critical }
 
 /// Розширення для SessionSeverity
 extension SessionSeverityExtension on SessionSeverity {

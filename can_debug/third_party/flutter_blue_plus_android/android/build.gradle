@@ -1,0 +1,37 @@
+group 'com.lib.flutter_blue_plus'
+version '1.0'
+
+apply plugin: 'com.android.library'
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}
+
+android {
+    compileSdkVersion = flutter.compileSdkVersion
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    lintOptions {
+        abortOnError false
+    }
+
+    defaultConfig {
+        minSdkVersion 21
+    }
+
+    gradle.projectsEvaluated {
+        tasks.withType(JavaCompile) {
+            options.compilerArgs << "-Xlint:deprecation"
+            options.compilerArgs << "-Xlint:unchecked"
+        }
+    }
+
+    // Conditional for compatibility with AGP <4.2.
+    if (project.android.hasProperty("namespace")) {
+        namespace 'com.lib.flutter_blue_plus'
+    }
+}

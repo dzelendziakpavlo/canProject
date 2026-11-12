@@ -15,6 +15,8 @@ enum CanSessionEventType {
   note,
 }
 
+enum DiagnosticEvidence { telemetry, inferred, simulated, legacyUnknown }
+
 enum DiagnosticSeverity { info, warning, error, critical }
 
 enum DiagnosticCause {
@@ -31,6 +33,7 @@ enum DiagnosticCause {
 }
 
 class CanSessionEvent {
+  final DiagnosticEvidence evidence;
   final String id;
   final CanSessionEventType type;
   final DateTime timestamp;
@@ -43,6 +46,7 @@ class CanSessionEvent {
   final Map<String, dynamic> data;
 
   const CanSessionEvent({
+    this.evidence = DiagnosticEvidence.inferred,
     required this.id,
     required this.type,
     required this.timestamp,
@@ -56,6 +60,7 @@ class CanSessionEvent {
   });
 
   factory CanSessionEvent.create({
+    DiagnosticEvidence evidence = DiagnosticEvidence.inferred,
     required CanSessionEventType type,
     required String message,
     String? sourceName,
@@ -67,6 +72,7 @@ class CanSessionEvent {
     DateTime? timestamp,
   }) {
     return CanSessionEvent(
+      evidence: evidence,
       id: DateTime.now().microsecondsSinceEpoch.toString(),
       type: type,
       timestamp: timestamp ?? DateTime.now(),
@@ -82,6 +88,7 @@ class CanSessionEvent {
 
   Map<String, dynamic> toJson() {
     return {
+      'evidence': evidence.name,
       'id': id,
       'type': type.name,
       'timestamp': timestamp.toIso8601String(),
@@ -97,6 +104,10 @@ class CanSessionEvent {
 
   factory CanSessionEvent.fromJson(Map<String, dynamic> json) {
     return CanSessionEvent(
+      evidence: DiagnosticEvidence.values.firstWhere(
+        (e) => e.name == json['evidence'],
+        orElse: () => DiagnosticEvidence.legacyUnknown,
+      ),
       id: json['id'] as String,
       type: CanSessionEventType.values.firstWhere(
         (eventType) => eventType.name == json['type'],
@@ -115,7 +126,8 @@ class CanSessionEvent {
       ),
       explanation: json['explanation'] as String?,
       recommendation: json['recommendation'] as String?,
-      data: (json['data'] as Map?)?.map(
+      data:
+          (json['data'] as Map?)?.map(
             (key, value) => MapEntry(key.toString(), value),
           ) ??
           const {},

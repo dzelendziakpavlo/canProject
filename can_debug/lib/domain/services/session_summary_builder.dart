@@ -1,3 +1,4 @@
+import '../services/recorded_frame_errors.dart';
 import '../detection/can_error_checker.dart';
 import '../models/can_frame.dart';
 import '../models/can_session.dart';
@@ -7,18 +8,22 @@ import '../models/can_session_summary.dart';
 
 /// Builds a derived session summary from the persisted session payload.
 class SessionSummaryBuilder {
-  final CanErrorChecker _checker;
-
-  SessionSummaryBuilder({CanErrorChecker? checker}) : _checker = checker ?? CanErrorChecker();
+  SessionSummaryBuilder({CanErrorChecker? checker});
 
   CanSessionSummary build(CanSession session) {
     final frames = List<CanFrame>.from(session.frames);
     final events = List<CanSessionEvent>.from(session.events);
     final truncated = session.totalFrames > frames.length;
     final totalFrames = truncated ? session.totalFrames : frames.length;
-    final errorStats = truncated ? session.errorStats : _checker.getErrorStatistics(frames);
-    final errorFrames = truncated ? session.errorFrames : frames.where((frame) => _checker.hasError(frame)).length;
-    final errorRate = truncated ? session.errorRate : (frames.isEmpty ? 0.0 : (errorFrames / frames.length) * 100.0);
+    final errorStats = truncated
+        ? session.errorStats
+        : recordedErrorStatistics(frames);
+    final errorFrames = truncated
+        ? session.errorFrames
+        : frames.where((frame) => recordedFrameErrors(frame).isNotEmpty).length;
+    final errorRate = truncated
+        ? session.errorRate
+        : (frames.isEmpty ? 0.0 : (errorFrames / frames.length) * 100.0);
 
     final sourceStateCounts = <String, int>{};
     final canIdCounts = <int, int>{};
@@ -47,12 +52,18 @@ class SessionSummaryBuilder {
           break;
         case CanSessionEventType.sourceStateChanged:
           sourceStateEvents++;
-          final state = event.data['newState']?.toString() ?? event.data['state']?.toString() ?? 'unknown';
+          final state =
+              event.data['newState']?.toString() ??
+              event.data['state']?.toString() ??
+              'unknown';
           sourceStateCounts[state] = (sourceStateCounts[state] ?? 0) + 1;
           break;
         case CanSessionEventType.statsSnapshot:
           statsSnapshotEvents++;
-          lastStatsTimestamp = _laterOf(lastStatsTimestamp, _extractTimestamp(event));
+          lastStatsTimestamp = _laterOf(
+            lastStatsTimestamp,
+            _extractTimestamp(event),
+          );
           break;
         case CanSessionEventType.frameBatch:
           frameBatchEvents++;
@@ -74,13 +85,16 @@ class SessionSummaryBuilder {
       canIdCounts[frame.id] = (canIdCounts[frame.id] ?? 0) + 1;
     }
 
-    final topCanIds = canIdCounts.entries
-        .map((entry) => CanIdCount(id: entry.key, count: entry.value))
-        .toList()
-      ..sort((a, b) => b.count.compareTo(a.count));
+    final topCanIds =
+        canIdCounts.entries
+            .map((entry) => CanIdCount(id: entry.key, count: entry.value))
+            .toList()
+          ..sort((a, b) => b.count.compareTo(a.count));
     final reconnectCount = sourceStateCounts['reconnecting'] ?? 0;
 
-    final latestStats = session.statsSnapshots.isNotEmpty ? session.statsSnapshots.last : null;
+    final latestStats = session.statsSnapshots.isNotEmpty
+        ? session.statsSnapshots.last
+        : null;
     final latestStatsTimestamp = latestStats?.timestamp;
     final healthScore = _calculateHealthScore(
       errorRate: errorRate,
@@ -94,7 +108,13 @@ class SessionSummaryBuilder {
       sessionId: session.id,
       sessionName: session.name,
       sourceName: session.sourceName,
-      monitorMode: session.sourceName == null ? 'unknown' : (session.sourceName!.toLowerCase().contains('ble') || session.sourceName!.toLowerCase().contains('can') || session.sourceName!.startsWith('USB Serial') ? 'hardware' : 'simulator'),
+      monitorMode: session.sourceName == null
+          ? 'unknown'
+          : (session.sourceName!.toLowerCase().contains('ble') ||
+                    session.sourceName!.toLowerCase().contains('can') ||
+                    session.sourceName!.startsWith('USB Serial')
+                ? 'hardware'
+                : 'simulator'),
       startTime: session.startTime,
       endTime: session.endTime,
       duration: session.duration,
@@ -179,8 +199,14 @@ class SessionSummaryBuilder {
     return score.clamp(0, 100);
   }
 
-  SessionSeverity _severityFor(double errorRate, CanStats? latestStats, int errorDetectedEvents) {
-    if (latestStats?.isBusOff == true || errorRate > 20 || errorDetectedEvents > 50) {
+  SessionSeverity _severityFor(
+    double errorRate,
+    CanStats? latestStats,
+    int errorDetectedEvents,
+  ) {
+    if (latestStats?.isBusOff == true ||
+        errorRate > 20 ||
+        errorDetectedEvents > 50) {
       return SessionSeverity.critical;
     }
     if (latestStats?.isErrorPassive == true || errorRate > 15) {

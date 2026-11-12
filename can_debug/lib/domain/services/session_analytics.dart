@@ -1,4 +1,4 @@
-import 'dart:math';
+import '../services/recorded_frame_errors.dart';
 
 import '../detection/can_error_checker.dart';
 import '../models/can_frame.dart';
@@ -46,8 +46,13 @@ class IdErrorStat {
   final int id;
   final int totalFrames;
   final int errorFrames;
-  double get percent => totalFrames == 0 ? 0.0 : (errorFrames / totalFrames) * 100.0;
-  IdErrorStat({required this.id, required this.totalFrames, required this.errorFrames});
+  double get percent =>
+      totalFrames == 0 ? 0.0 : (errorFrames / totalFrames) * 100.0;
+  IdErrorStat({
+    required this.id,
+    required this.totalFrames,
+    required this.errorFrames,
+  });
 }
 
 class SessionAnalyticsBuilder {
@@ -55,8 +60,8 @@ class SessionAnalyticsBuilder {
 
   SessionAnalyticsData build(CanSession session) {
     final frames = List<CanFrame>.from(session.frames);
-    // Compute error stats via checker to avoid relying on untyped saved errors
-    final errorStats = _checker.getErrorStatistics(frames);
+    // Only recorded evidence; opening Analytics must never generate new errors.
+    final errorStats = recordedErrorStatistics(frames);
 
     final errorsOverTime = _buildErrorsOverTime(frames);
     final bitErrorRatio = _buildBitErrorRatioOverTime(frames);
@@ -89,7 +94,7 @@ class SessionAnalyticsBuilder {
 
     for (final f in frames) {
       final key = _bucketKey(f.timestamp, bucketDuration);
-      final hasErr = _checker.analyzeFrame(f).isNotEmpty;
+      final hasErr = recordedFrameErrors(f).isNotEmpty;
       if (hasErr) {
         buckets[key] = (buckets[key] ?? 0) + 1;
       } else {
@@ -114,11 +119,11 @@ class SessionAnalyticsBuilder {
 
     for (final f in frames) {
       final key = _bucketKey(f.timestamp, bucketDuration);
-      final totalBits = _estimateTotalBits(f);
+      const totalBits = 1;
       bitsByBucket[key] = (bitsByBucket[key] ?? 0) + totalBits;
 
-      final errors = _checker.analyzeFrame(f);
-      final errBits = errors.fold<int>(0, (sum, e) => sum + _estimateErrorBits(e));
+      final errors = recordedFrameErrors(f);
+      final errBits = errors.isEmpty ? 0 : 1;
       errBitsByBucket[key] = (errBitsByBucket[key] ?? 0) + errBits;
     }
 
@@ -133,10 +138,12 @@ class SessionAnalyticsBuilder {
 
   HeatmapData _buildHeatmap(List<CanFrame> frames) {
     // 24 x 6 (hour x 10-minute slots)
-    final matrix = <int, List<int>>{for (var h = 0; h < 24; h++) h: List.filled(6, 0)};
+    final matrix = <int, List<int>>{
+      for (var h = 0; h < 24; h++) h: List.filled(6, 0),
+    };
     var maxCount = 0;
     for (final f in frames) {
-      final hasErr = _checker.analyzeFrame(f).isNotEmpty;
+      final hasErr = recordedFrameErrors(f).isNotEmpty;
       if (!hasErr) continue;
       final hour = f.timestamp.hour;
       final slot = (f.timestamp.minute / 10).floor().clamp(0, 5);
@@ -151,16 +158,18 @@ class SessionAnalyticsBuilder {
     final perIdErr = <int, int>{};
     for (final f in frames) {
       perIdTotal[f.id] = (perIdTotal[f.id] ?? 0) + 1;
-      final hasErr = _checker.analyzeFrame(f).isNotEmpty;
+      final hasErr = recordedFrameErrors(f).isNotEmpty;
       if (hasErr) perIdErr[f.id] = (perIdErr[f.id] ?? 0) + 1;
     }
     final list = <IdErrorStat>[];
     for (final entry in perIdTotal.entries) {
-      list.add(IdErrorStat(
-        id: entry.key,
-        totalFrames: entry.value,
-        errorFrames: perIdErr[entry.key] ?? 0,
-      ));
+      list.add(
+        IdErrorStat(
+          id: entry.key,
+          totalFrames: entry.value,
+          errorFrames: perIdErr[entry.key] ?? 0,
+        ),
+      );
     }
     list.sort((a, b) => b.percent.compareTo(a.percent));
     return list;
@@ -171,36 +180,5 @@ class SessionAnalyticsBuilder {
     final bucketMicros = bucket.inMicroseconds;
     final start = (micros ~/ bucketMicros) * bucketMicros;
     return DateTime.fromMicrosecondsSinceEpoch(start);
-  }
-
-  int _estimateTotalBits(CanFrame f) {
-    // Approximate: standard CAN frame ~ 47 bits overhead + dlc*8 data bits.
-    // We don't track IDE here; assume standard-ish frame length.
-    return 47 + (f.dlc * 8) + 15; // include CRC field length
-  }
-
-  int _estimateErrorBits(CanErrorInfo e) {
-    switch (e.type) {
-      case CanErrorType.crcError:
-        return 2; // assume ~2 bits flipped
-      case CanErrorType.stuffingError:
-        final seq = e.details['sequence'] as String?;
-        if (seq == null) return 1;
-        // stuffing violation occurs after 5 identical bits
-        return max(1, seq.length - 5);
-      case CanErrorType.formError:
-      case CanErrorType.formatError:
-        return 1;
-      case CanErrorType.ackError:
-        return 1;
-      case CanErrorType.overloadError:
-        return 0; // not a bit flip but bus condition
-      case CanErrorType.activeError:
-      case CanErrorType.passiveError:
-      case CanErrorType.busOffError:
-        return 0;
-      case CanErrorType.none:
-        return 0;
-    }
   }
 }

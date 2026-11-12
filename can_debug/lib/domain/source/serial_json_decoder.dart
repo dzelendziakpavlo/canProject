@@ -92,6 +92,9 @@ class SerialJsonDecoder {
             raw,
             host,
             frame: CanFrame.create(
+              sequence: value['seq'] as int?,
+              receiverTimestampMs: value['ts'] as int?,
+              rawWire: Map<String, dynamic>.from(value),
               id: id,
               dlc: dlc,
               data: List<int>.from(data),

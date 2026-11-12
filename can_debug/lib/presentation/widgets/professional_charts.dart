@@ -38,9 +38,7 @@ class ProfessionalErrorRateChart extends StatelessWidget {
         children: [
           _buildHeader(context),
           const SizedBox(height: 16),
-          Expanded(
-            child: _buildChart(context),
-          ),
+          Expanded(child: _buildChart(context)),
         ],
       ),
     );
@@ -52,9 +50,9 @@ class ProfessionalErrorRateChart extends StatelessWidget {
       children: [
         Text(
           'Live Error Rate',
-          style: Theme.of(context).textTheme.titleMedium?.copyWith(
-            fontWeight: FontWeight.bold,
-          ),
+          style: Theme.of(
+            context,
+          ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
         ),
         Row(
           children: [
@@ -85,9 +83,9 @@ class ProfessionalErrorRateChart extends StatelessWidget {
       return Center(
         child: Text(
           'No data available',
-          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-            color: Colors.grey,
-          ),
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: Colors.grey),
         ),
       );
     }
@@ -100,16 +98,10 @@ class ProfessionalErrorRateChart extends StatelessWidget {
           horizontalInterval: 5,
           verticalInterval: 10,
           getDrawingHorizontalLine: (value) {
-            return FlLine(
-              color: Colors.grey.withOpacity(0.3),
-              strokeWidth: 1,
-            );
+            return FlLine(color: Colors.grey.withOpacity(0.3), strokeWidth: 1);
           },
           getDrawingVerticalLine: (value) {
-            return FlLine(
-              color: Colors.grey.withOpacity(0.3),
-              strokeWidth: 1,
-            );
+            return FlLine(color: Colors.grey.withOpacity(0.3), strokeWidth: 1);
           },
         ),
         titlesData: FlTitlesData(
@@ -161,10 +153,7 @@ class ProfessionalErrorRateChart extends StatelessWidget {
         ),
         borderData: FlBorderData(
           show: true,
-          border: Border.all(
-            color: Colors.grey.withOpacity(0.3),
-            width: 1,
-          ),
+          border: Border.all(color: Colors.grey.withOpacity(0.3), width: 1),
         ),
         minX: 0,
         maxX: errorRateHistory.length.toDouble() - 1,
@@ -261,7 +250,7 @@ class ErrorTypeDistributionChart extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final totalErrors = errorStats.values.fold(0, (sum, count) => sum + count);
-    
+
     if (totalErrors == 0) {
       return Container(
         height: height,
@@ -286,9 +275,7 @@ class ErrorTypeDistributionChart extends StatelessWidget {
     }
 
     // Prepare ranked top errors (max 6) for compact view and stable indexing
-    final ranked = errorStats.entries
-        .where((e) => e.value > 0)
-        .toList()
+    final ranked = errorStats.entries.where((e) => e.value > 0).toList()
       ..sort((a, b) => b.value.compareTo(a.value));
     final top = ranked.take(6).toList();
 
@@ -296,67 +283,71 @@ class ErrorTypeDistributionChart extends StatelessWidget {
     final outerRadius = (height * 0.32).clamp(32, 34).toDouble();
     final innerRadius = (outerRadius * 0.28).clamp(18, outerRadius - 10);
 
+    final pie = SizedBox(
+      height: 140,
+      width: 150,
+      child: PieChart(
+        PieChartData(
+          sections: _getPieSectionsFrom(top, totalErrors, outerRadius),
+          borderData: FlBorderData(show: false),
+          sectionsSpace: 1.5,
+          centerSpaceRadius: innerRadius.toDouble(),
+          pieTouchData: PieTouchData(
+            enabled: onSliceTap != null,
+            touchCallback: (event, response) {
+              if (event is! FlTapUpEvent) return;
+              final index = response?.touchedSection?.touchedSectionIndex;
+              if (index != null && index >= 0 && index < top.length)
+                onSliceTap?.call(top[index].key);
+            },
+          ),
+        ),
+      ),
+    );
     return Container(
-      height: height+50,
-      padding: const EdgeInsets.all(16.0),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
         borderRadius: BorderRadius.circular(12),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.1),
-            blurRadius: 8,
-            offset: const Offset(0, 2),
-          ),
-        ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
             'Error Distribution',
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.bold,
-            ),
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
           ),
-          const SizedBox(height: 16),
-          Expanded(
-            child: Row(
-              children: [
-                Expanded(
-                  flex: 2,
-                  child: PieChart(
-                    PieChartData(
-                      sections: _getPieSectionsFrom(top, totalErrors, outerRadius),
-                      borderData: FlBorderData(show: false),
-                      sectionsSpace: 1.5,
-                      centerSpaceRadius: innerRadius.toDouble(), // thinner ring
-                      pieTouchData: PieTouchData(
-                        enabled: onSliceTap != null,
-                        touchCallback: (FlTouchEvent event, pieTouchResponse) {
-                          if (onSliceTap == null) return;
-                          if (event is! FlTapUpEvent) return;
-                          final idx = pieTouchResponse?.touchedSection?.touchedSectionIndex;
-                          if (idx == null) return;
-                          if (idx >= 0 && idx < top.length) {
-                            onSliceTap!(top[idx].key);
-                          }
-                        },
-                      ),
-                    ),
+          const SizedBox(height: 12),
+          LayoutBuilder(
+            builder: (context, constraints) => constraints.maxWidth < 400
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Center(child: pie),
+                      const SizedBox(height: 12),
+                      _buildLegend(context, top),
+                    ],
+                  )
+                : Row(
+                    children: [
+                      pie,
+                      const SizedBox(width: 16),
+                      Expanded(child: _buildLegend(context, top)),
+                    ],
                   ),
-                ),
-                const SizedBox(width: 16),
-                Expanded(flex: 1, child: _buildLegend(context, top)),
-              ],
-            ),
           ),
         ],
       ),
     );
   }
 
-  List<PieChartSectionData> _getPieSectionsFrom(List<MapEntry<CanErrorType, int>> top, int totalErrors, double outerRadius) {
+  List<PieChartSectionData> _getPieSectionsFrom(
+    List<MapEntry<CanErrorType, int>> top,
+    int totalErrors,
+    double outerRadius,
+  ) {
     final sections = <PieChartSectionData>[];
     for (final entry in top) {
       final percentage = (entry.value / totalErrors) * 100;
@@ -378,7 +369,10 @@ class ErrorTypeDistributionChart extends StatelessWidget {
     return sections;
   }
 
-  Widget _buildLegend(BuildContext context, List<MapEntry<CanErrorType, int>> top) {
+  Widget _buildLegend(
+    BuildContext context,
+    List<MapEntry<CanErrorType, int>> top,
+  ) {
     return Wrap(
       spacing: 8,
       runSpacing: 6,
@@ -401,14 +395,18 @@ class ErrorTypeDistributionChart extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 6),
-              Text(
-                _getErrorTypeName(entry.key),
-                style: Theme.of(context).textTheme.bodySmall,
+              Flexible(
+                child: Text(
+                  _getErrorTypeName(entry.key),
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
               ),
               const SizedBox(width: 4),
               Text(
                 '${entry.value}',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.bold),
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.bold),
               ),
             ],
           ),

@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import '../../data/ble_capture_database.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/can_session.dart';
@@ -14,15 +16,46 @@ import 'session_summary_builder.dart';
 class CanSessionService {
   static const String _sessionsKey = 'can_sessions';
   static const String _sessionCounterKey = 'session_counter';
-  
+
   static CanSessionService? _instance;
   static CanSessionService get instance => _instance ??= CanSessionService._();
-  
-  CanSessionService._();
+
+  CanSessionService._()
+    : _store = BleCaptureDatabase(),
+      _enableBleStorage = Platform.isAndroid;
+  CanSessionService.forTesting(BleCaptureDatabase store)
+    : _store = store,
+      _enableBleStorage = true;
+  final BleCaptureDatabase _store;
+  final bool _enableBleStorage;
+  BleCaptureWriter? _writer;
+  Object? persistenceError;
+  bool _initialized = false;
+  Map<String, dynamic> get persistenceDiagnostics =>
+      _writer?.diagnostics ?? const {};
+  bool get isStreamingToDatabase => _writer != null;
+  void recordAcceptedFrame(CanFrame frame) => _writer?.frame(frame);
+  void updateCaptureMetadata(Map<String, dynamic> metadata) {
+    if (_currentSession != null) {
+      _currentSession = _currentSession!.updateWith(
+        captureMetadata: {..._currentSession!.captureMetadata, ...metadata},
+      );
+    }
+  }
+
+  Future<void> checkpoint() async {
+    await _writer?.flush();
+  }
+
+  Future<CanSession> readStoredSession(CanSession fallback) async {
+    if (fallback.captureMetadata['storage'] != 'sqlite') return fallback;
+    return await _store.read(fallback.id) ??
+        (throw StateError('Stored session missing: ${fallback.id}'));
+  }
 
   CanSession? _currentSession;
   final List<CanSession> _savedSessions = [];
-  final StreamController<List<CanSession>> _sessionsController = 
+  final StreamController<List<CanSession>> _sessionsController =
       StreamController<List<CanSession>>.broadcast();
 
   /// Stream сесій
@@ -38,17 +71,52 @@ class CanSessionService {
 
   /// Ініціалізація сервісу
   Future<void> initialize() async {
+    if (_initialized) return;
     await _loadSessions();
+    if (_enableBleStorage) {
+      final captures = await _store.previews();
+      final ids = captures.map((s) => s.id).toSet();
+      _savedSessions.removeWhere((s) => ids.contains(s.id));
+      _savedSessions.addAll(captures);
+      _savedSessions.sort((a, b) => b.startTime.compareTo(a.startTime));
+      _sessionsController.add(savedSessions);
+    }
+    _initialized = true;
   }
 
   /// Створити нову сесію
   Future<CanSession> createSession({String? sourceName}) async {
+    if (_currentSession != null) {
+      throw StateError('Finish the active session before starting another');
+    }
+    await initialize();
+    persistenceError = null;
     final sessionNumber = await _getNextSessionNumber();
     final sessionName = 'Schema $sessionNumber';
-    
-    _currentSession = CanSession.create(sessionName).updateWith(
-      sourceName: sourceName,
-    );
+
+    _currentSession = CanSession.create(
+      sessionName,
+    ).updateWith(sourceName: sourceName);
+    if (_enableBleStorage && sourceName?.startsWith('BLE') == true) {
+      _currentSession = _currentSession!.updateWith(
+        captureMetadata: {
+          'storage': 'sqlite',
+          'captureScope': 'all accepted BLE messages',
+        },
+      );
+      try {
+        await _store.begin(_currentSession!);
+        _writer = BleCaptureWriter(
+          store: _store,
+          session: () => _currentSession!,
+          onError: (e) => persistenceError = e,
+        );
+      } catch (e) {
+        _currentSession = null;
+        persistenceError = e;
+        rethrow;
+      }
+    }
     return _currentSession!;
   }
 
@@ -71,7 +139,7 @@ class CanSessionService {
       statsSnapshots: statsSnapshots != null ? List.from(statsSnapshots) : null,
       events: events != null ? List.from(events) : null,
       errorStats: Map.from(errorStats),
-      totalFrames: totalFrames,
+      totalFrames: _writer?.receivedFrames ?? totalFrames,
       errorFrames: errorFrames,
       errorRate: errorRate,
     );
@@ -81,9 +149,13 @@ class CanSessionService {
   void recordSessionEvent(CanSessionEvent event) {
     if (_currentSession == null) return;
 
-    final updatedEvents = List<CanSessionEvent>.from(_currentSession!.events)..add(event);
+    _writer?.event(event);
+    final updatedEvents = List<CanSessionEvent>.from(_currentSession!.events)
+      ..add(event);
     // Complete USB wire history is on disk; bound the live analysis snapshot.
-    if (_currentSession!.sourceName?.startsWith('USB Serial') == true && updatedEvents.length > 2000) {
+    if ((_writer != null ||
+            _currentSession!.sourceName?.startsWith('USB Serial') == true) &&
+        updatedEvents.length > 2000) {
       updatedEvents.removeRange(0, updatedEvents.length - 2000);
     }
     _currentSession = _currentSession!.updateWith(events: updatedEvents);
@@ -93,11 +165,18 @@ class CanSessionService {
   void recordStatsSnapshot(CanStats stats) {
     if (_currentSession == null) return;
 
-    final updatedSnapshots = List<CanStats>.from(_currentSession!.statsSnapshots)..add(stats);
-    if (_currentSession!.sourceName?.startsWith('USB Serial') == true && updatedSnapshots.length > 600) {
+    _writer?.stats(stats);
+    final updatedSnapshots = List<CanStats>.from(
+      _currentSession!.statsSnapshots,
+    )..add(stats);
+    if ((_writer != null ||
+            _currentSession!.sourceName?.startsWith('USB Serial') == true) &&
+        updatedSnapshots.length > 600) {
       updatedSnapshots.removeRange(0, updatedSnapshots.length - 600);
     }
-    _currentSession = _currentSession!.updateWith(statsSnapshots: updatedSnapshots);
+    _currentSession = _currentSession!.updateWith(
+      statsSnapshots: updatedSnapshots,
+    );
   }
 
   /// Побудувати derived summary для будь-якої сесії.
@@ -123,16 +202,40 @@ class CanSessionService {
   Future<void> completeCurrentSession() async {
     if (_currentSession == null) return;
 
-    final completedSession = _currentSession!.complete();
-    _savedSessions.insert(0, completedSession); // Додати на початок списку
+    final completedSession = _currentSession!
+        .updateWith(
+          captureMetadata: {
+            ..._currentSession!.captureMetadata,
+            ...persistenceDiagnostics,
+          },
+        )
+        .complete();
+    if (_writer != null) {
+      await _writer!.close(completedSession);
+      final stored = await _store.read(completedSession.id, preview: true);
+      _savedSessions.insert(0, stored!);
+      _writer = null;
+    } else {
+      final prefs = await SharedPreferences.getInstance();
+      final sessions = [
+        completedSession,
+        ..._savedSessions,
+      ].where((s) => s.captureMetadata['storage'] != 'sqlite').toList();
+      if (!await prefs.setString(
+        _sessionsKey,
+        jsonEncode(sessions.map((s) => s.toJson()).toList()),
+      )) {
+        throw StateError('Session storage rejected the write');
+      }
+      _savedSessions.insert(0, completedSession);
+    }
     _currentSession = null;
-
-    await _saveSessions();
-    _sessionsController.add(_savedSessions);
+    _sessionsController.add(savedSessions);
   }
 
   /// Видалити сесію
   Future<void> deleteSession(String sessionId) async {
+    if (_enableBleStorage) await _store.delete(sessionId);
     _savedSessions.removeWhere((session) => session.id == sessionId);
     await _saveSessions();
     _sessionsController.add(_savedSessions);
@@ -140,6 +243,13 @@ class CanSessionService {
 
   /// Очистити всі сесії
   Future<void> clearAllSessions() async {
+    if (_enableBleStorage) {
+      for (final session in _savedSessions) {
+        if (session.captureMetadata['storage'] == 'sqlite') {
+          await _store.delete(session.id);
+        }
+      }
+    }
     _savedSessions.clear();
     await _saveSessions();
     _sessionsController.add(_savedSessions);
@@ -152,11 +262,17 @@ class CanSessionService {
     CanSession toSave = session;
     if (exists) {
       final Map<String, dynamic> map = session.toJson();
-      map['id'] = DateTime.now().millisecondsSinceEpoch.toString();
+      map['id'] = DateTime.now().microsecondsSinceEpoch.toString();
       map['name'] = '${session.name} (imported)';
       toSave = CanSession.fromJson(map);
     }
 
+    toSave = toSave.updateWith(
+      captureMetadata: {
+        ...toSave.captureMetadata,
+        'storage': 'imported_snapshot',
+      },
+    );
     _savedSessions.insert(0, toSave);
     await _saveSessions();
     _sessionsController.add(_savedSessions);
@@ -178,13 +294,26 @@ class CanSessionService {
     }
 
     final totalSessions = _savedSessions.length;
-    final totalFrames = _savedSessions.fold<int>(0, (sum, session) => sum + session.totalFrames);
-    final totalErrors = _savedSessions.fold<int>(0, (sum, session) => sum + session.errorFrames);
-    final averageErrorRate = _savedSessions.fold<double>(0, (sum, session) => sum + session.errorRate) / totalSessions;
-    
+    final totalFrames = _savedSessions.fold<int>(
+      0,
+      (sum, session) => sum + session.totalFrames,
+    );
+    final totalErrors = _savedSessions.fold<int>(
+      0,
+      (sum, session) => sum + session.errorFrames,
+    );
+    final averageErrorRate =
+        _savedSessions.fold<double>(
+          0,
+          (sum, session) => sum + session.errorRate,
+        ) /
+        totalSessions;
+
     final severityCounts = <SessionSeverity, int>{};
     for (final severity in SessionSeverity.values) {
-      severityCounts[severity] = _savedSessions.where((s) => s.severity == severity).length;
+      severityCounts[severity] = _savedSessions
+          .where((s) => s.severity == severity)
+          .length;
     }
 
     final totalDuration = _savedSessions.fold<Duration>(
@@ -207,7 +336,7 @@ class CanSessionService {
     try {
       final prefs = await SharedPreferences.getInstance();
       final sessionsJson = prefs.getString(_sessionsKey);
-      
+
       if (sessionsJson != null) {
         final List<dynamic> sessionsList = jsonDecode(sessionsJson);
         _savedSessions.clear();
@@ -215,27 +344,10 @@ class CanSessionService {
           sessionsList.map((json) => CanSession.fromJson(json)).toList(),
         );
         _sessionsController.add(_savedSessions);
-
-        final needsMigration = _savedSessions.any(
-          (session) => session.schemaVersion < CanSession.currentSchemaVersion,
-        );
-        if (needsMigration) {
-          _savedSessions.replaceRange(
-            0,
-            _savedSessions.length,
-            _savedSessions
-                .map(
-                  (session) => session.updateWith(
-                    schemaVersion: CanSession.currentSchemaVersion,
-                  ),
-                )
-                .toList(),
-          );
-          await _saveSessions();
-        }
       }
     } catch (e) {
-      print('Error loading sessions: $e');
+      persistenceError = e;
+      rethrow;
     }
   }
 
@@ -243,10 +355,18 @@ class CanSessionService {
   Future<void> _saveSessions() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final sessionsJson = jsonEncode(_savedSessions.map((s) => s.toJson()).toList());
-      await prefs.setString(_sessionsKey, sessionsJson);
+      final sessionsJson = jsonEncode(
+        _savedSessions
+            .where((s) => s.captureMetadata['storage'] != 'sqlite')
+            .map((s) => s.toJson())
+            .toList(),
+      );
+      if (!await prefs.setString(_sessionsKey, sessionsJson)) {
+        throw StateError('Session storage rejected the write');
+      }
     } catch (e) {
-      print('Error saving sessions: $e');
+      persistenceError = e;
+      rethrow;
     }
   }
 
@@ -266,7 +386,15 @@ class CanSessionService {
 
   /// Відкинути поточну сесію без збереження
   /// Використовується коли користувач відмовляється зберігати сесію
-  void discardCurrentSession() {
+  Future<void> discardCurrentSession() async {
+    final writer = _writer;
+    final id = _currentSession?.id;
+    if (writer != null) {
+      await writer.flush();
+      writer.abandon();
+      if (id != null) await _store.delete(id);
+    }
+    _writer = null;
     _currentSession = null;
   }
 }
@@ -304,7 +432,7 @@ class SessionsAnalytics {
   String get formattedTotalDuration {
     final hours = totalDuration.inHours;
     final minutes = (totalDuration.inMinutes % 60);
-    
+
     if (hours > 0) {
       return '${hours}h ${minutes}m';
     } else {
