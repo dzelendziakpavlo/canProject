@@ -37,7 +37,7 @@ class CanStats {
     required this.isNoAckMode,
     required this.isSpeedMismatchDemo,
     this.telemetrySchema = 1,
-    this.nodeName = 'receiver',
+    this.nodeName = 'unknown',
     this.firmwareVersion = 'unknown',
     this.uptimeMs,
     this.bitrate,
@@ -48,6 +48,11 @@ class CanStats {
   bool get isBusOff => busState == 'BUS_OFF';
   bool get isRecovering => busState == 'RECOVERING';
   bool get isRunning => busState == 'RUNNING';
+
+  /// Optional counters are known only when explicitly supplied on the wire.
+  bool hasWireCounter(String key) => rawWire != null
+      ? rawWire![key] is int
+      : const {'rx', 'txe', 'rxe', 'missed', 'buserr'}.contains(key);
   // TEC or REC > 127 means the node entered error-passive state per CAN spec.
   // TWAI keeps state=RUNNING until TEC > 255 (bus-off), so we check counters directly.
   bool get isErrorPassive => txErrorCounter > 127 || rxErrorCounter > 127;
@@ -71,7 +76,7 @@ class CanStats {
     isNoAckMode: (json['noack'] as int?) == 1,
     isSpeedMismatchDemo: (json['sdemo'] as int?) == 1,
     telemetrySchema: (json['v'] as int?) ?? 1,
-    nodeName: (json['node'] as String?) ?? 'receiver',
+    nodeName: (json['node'] as String?) ?? 'unknown',
     firmwareVersion: (json['fw'] as String?) ?? 'unknown',
     uptimeMs: json['uptime'] as int?,
     bitrate: json['bitrate'] as int?,
@@ -115,7 +120,7 @@ class CanStats {
     isNoAckMode: (json['noack'] as int?) == 1,
     isSpeedMismatchDemo: (json['sdemo'] as int?) == 1,
     telemetrySchema: (json['v'] as int?) ?? 1,
-    nodeName: (json['node'] as String?) ?? 'receiver',
+    nodeName: (json['node'] as String?) ?? 'unknown',
     firmwareVersion: (json['fw'] as String?) ?? 'unknown',
     uptimeMs: json['uptime'] as int?,
     bitrate: json['bitrate'] as int?,

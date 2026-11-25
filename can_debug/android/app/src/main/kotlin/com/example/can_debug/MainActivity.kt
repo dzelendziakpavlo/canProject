@@ -3,8 +3,13 @@ package com.example.can_debug
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.os.Bundle
 import android.provider.OpenableColumns
 import android.util.Log
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import io.flutter.embedding.android.FlutterActivity
@@ -19,6 +24,46 @@ class MainActivity : FlutterActivity() {
     private val exportRequest = 27041
     private var launchedHere = false
     private val exportPrefs get() = getSharedPreferences("can_debug_exports", MODE_PRIVATE)
+    private var keyboardVisible = false
+    private val restoreSystemBars = Runnable {
+        if (hasWindowFocus() && !keyboardVisible) hideSystemBars()
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Activity-wide immersive policy covers every Flutter route.
+        hideSystemBars()
+        ViewCompat.setOnApplyWindowInsetsListener(window.decorView) { view, insets ->
+            val visible = insets.isVisible(WindowInsetsCompat.Type.ime())
+            if (keyboardVisible && !visible) {
+                // Android may keep system bars visible briefly after the IME closes.
+                view.removeCallbacks(restoreSystemBars)
+                view.postDelayed(restoreSystemBars, 1100)
+            }
+            keyboardVisible = visible
+            ViewCompat.onApplyWindowInsets(view, insets)
+        }
+        ViewCompat.requestApplyInsets(window.decorView)
+    }
+
+    private fun hideSystemBars() {
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
+    }
+
+    override fun onDestroy() {
+        window.decorView.removeCallbacks(restoreSystemBars)
+        ViewCompat.setOnApplyWindowInsetsListener(window.decorView, null)
+        super.onDestroy()
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         GeneratedPluginRegistrant.registerWith(flutterEngine)

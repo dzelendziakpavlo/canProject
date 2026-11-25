@@ -19,11 +19,13 @@ import '../../domain/services/can_session_service.dart';
 import '../../core/theme.dart';
 import '../../core/windows_capture_guard.dart';
 import '../widgets/animated_widgets.dart';
+import '../widgets/can_bus_diagnostics_panel.dart';
 
 /// Monitor screen that displays live CAN frame data
 class MonitorScreen extends StatefulWidget {
   final CanFrameSource? source;
-  const MonitorScreen({super.key, this.source});
+  final DateTime Function()? diagnosticsClock;
+  const MonitorScreen({super.key, this.source, this.diagnosticsClock});
 
   @override
   State<MonitorScreen> createState() => _MonitorScreenState();
@@ -31,7 +33,10 @@ class MonitorScreen extends StatefulWidget {
 
 class _MonitorScreenState extends State<MonitorScreen>
     with WidgetsBindingObserver {
-  final _telemetryDiagnostics = TelemetryDiagnostics();
+  late final TelemetryDiagnostics _telemetryDiagnostics;
+  bool get _isHardware => _source.statsStream != null;
+  DateTime get _diagnosticsNow =>
+      (widget.diagnosticsClock ?? DateTime.now)().toUtc();
   bool _accepting = false;
   bool _transitioning = false;
   Future<void>? _stopFuture;
@@ -39,7 +44,6 @@ class _MonitorScreenState extends State<MonitorScreen>
   SerialCanSource? get _serial =>
       _source is SerialCanSource ? _source as SerialCanSource : null;
   int _uiDroppedFrames = 0;
-  DateTime? _monitorStartedAt;
   WindowsCaptureGuard? _windowGuard;
   late StreamSubscription<CanFrame> _subscription;
   final CanErrorChecker _errorChecker = CanErrorChecker();
@@ -77,9 +81,6 @@ class _MonitorScreenState extends State<MonitorScreen>
   CanStats? _latestStats;
   StreamSubscription<CanStats>? _statsStreamSub;
 
-  // Frame-timeout detection: if BLE source is streaming but no frames arrive for
-  // this duration, we show a "bus silent" warning (wire disconnected, etc.)
-  static const _frameTimeoutDuration = Duration(seconds: 3);
   DateTime? _lastFrameAt;
   double _framesPerSecond = 0.0;
   int _reconnectCount = 0;
@@ -89,8 +90,21 @@ class _MonitorScreenState extends State<MonitorScreen>
     findings: [],
   );
   List<CanAnomaly> _anomalies = const [];
-  // ignore: prefer_final_fields
   bool _busIsSilent = false;
+
+  void _recordDiagnostics(Iterable<CanSessionEvent> events) {
+    for (final event in events) {
+      _sessionService.recordSessionEvent(event);
+    }
+  }
+
+  void _refreshDiagnostics() {
+    if (!_isHardware) return;
+    _recordDiagnostics(_telemetryDiagnostics.poll(sourceName: _source.name));
+    final current = _telemetryDiagnostics.snapshot;
+    _latestStats = current.stats;
+    _busIsSilent = current.traffic == CanTrafficState.silent;
+  }
 
   void _recordSourceEvent({
     required CanSessionEventType type,
@@ -117,6 +131,7 @@ class _MonitorScreenState extends State<MonitorScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _source = widget.source ?? CanFrameSimulator();
+    _telemetryDiagnostics = TelemetryDiagnostics(clock: () => _diagnosticsNow);
     _sourceState = _serial?.state;
     if (_serial != null) {
       _windowGuard = WindowsCaptureGuard(() async {
@@ -132,6 +147,12 @@ class _MonitorScreenState extends State<MonitorScreen>
       final previousState = _sourceState;
       if (s == previousState) return;
       if (s == SourceState.reconnecting) _reconnectCount++;
+      if (_isHardware) {
+        _recordDiagnostics(
+          _telemetryDiagnostics.updateSourceState(s, sourceName: _source.name),
+        );
+        _refreshDiagnostics();
+      }
       if (mounted) setState(() => _sourceState = s);
       _recordSourceEvent(
         type: CanSessionEventType.sourceStateChanged,
@@ -158,9 +179,15 @@ class _MonitorScreenState extends State<MonitorScreen>
           'busState': stats.busState,
           'rxMissed': stats.rxMissed,
           'busErrorCount': stats.busErrorCount,
-          'arbLostCount': stats.arbLostCount,
-          'txFailedCount': stats.txFailedCount,
-          'rxOverrunCount': stats.rxOverrunCount,
+          'arbLostCount': stats.hasWireCounter('arb')
+              ? stats.arbLostCount
+              : null,
+          'txFailedCount': stats.hasWireCounter('txfail')
+              ? stats.txFailedCount
+              : null,
+          'rxOverrunCount': stats.hasWireCounter('ovr')
+              ? stats.rxOverrunCount
+              : null,
           'isErrorPassive': stats.isErrorPassive,
           'isErrorWarning': stats.isErrorWarning,
           'isBusOff': stats.isBusOff,
@@ -184,12 +211,6 @@ class _MonitorScreenState extends State<MonitorScreen>
                   previous.uptimeMs != null &&
                   stats.uptimeMs! < previous.uptimeMs!));
       final prev = countersReset ? null : previous;
-      if (countersReset) {
-        _recordSourceEvent(
-          type: CanSessionEventType.note,
-          message: 'Receiver counters reset; starting a new delta baseline',
-        );
-      }
 
       // TWAI deltas since last stats packet (arrives every ~1 s from ESP32)
       final errorDelta =
@@ -204,13 +225,11 @@ class _MonitorScreenState extends State<MonitorScreen>
           _errorRateHistory.removeAt(0);
         }
       }
-      for (final event in _telemetryDiagnostics.accept(
-        stats,
-        sourceName: _source.name,
-      )) {
-        _sessionService.recordSessionEvent(event);
-      }
-      setState(() => _latestStats = stats);
+      _recordDiagnostics(
+        _telemetryDiagnostics.accept(stats, sourceName: _source.name),
+      );
+      _refreshDiagnostics();
+      setState(() {});
       _updateHealthReport();
       _updateAnomalyReport();
     });
@@ -221,6 +240,10 @@ class _MonitorScreenState extends State<MonitorScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    // Cancel listeners before stop(): a source may emit its final state synchronously.
+    _stateSub?.cancel();
+    _statsStreamSub?.cancel();
+    _subscription.cancel();
     if (_accepting) {
       // Route disposal cannot be awaited. Stop radio delivery and checkpoint the
       // accepted tail; an interrupted capture remains recoverable on next launch.
@@ -235,9 +258,6 @@ class _MonitorScreenState extends State<MonitorScreen>
     }
     _windowGuard?.dispose();
     _uiTimer?.cancel();
-    _stateSub?.cancel();
-    _statsStreamSub?.cancel();
-    _subscription.cancel();
     _source.dispose();
     super.dispose();
   }
@@ -281,6 +301,12 @@ class _MonitorScreenState extends State<MonitorScreen>
       if (!_accepting) return;
       _sessionService.recordAcceptedFrame(frame);
       _lastFrameAt = DateTime.now();
+      if (_isHardware) {
+        _recordDiagnostics(
+          _telemetryDiagnostics.frameReceived(sourceName: _source.name),
+        );
+        _refreshDiagnostics();
+      }
       // The independent experiment journal already received this frame.
       // Bound display backlog even if rendering temporarily stalls.
       if (_pendingFrames.length >= 4096) {
@@ -312,18 +338,7 @@ class _MonitorScreenState extends State<MonitorScreen>
     );
     final nextFps = _recentFrameTimes.length.toDouble();
 
-    // Frame-timeout check: only for hardware BLE source while streaming
-    if (_source.statsStream != null && _sourceState == SourceState.streaming) {
-      final origin = _lastFrameAt ?? _monitorStartedAt;
-      final silent =
-          origin != null &&
-          now.difference(origin) > _frameTimeoutDuration &&
-          (_serial == null ||
-              (_serial!.lastMessageAt != null &&
-                  now.toUtc().difference(_serial!.lastMessageAt!) <
-                      const Duration(seconds: 4)));
-      if (silent != _busIsSilent) setState(() => _busIsSilent = silent);
-    }
+    _refreshDiagnostics();
 
     if (_pendingFrames.isEmpty) {
       if (_framesPerSecond != nextFps) {
@@ -343,11 +358,6 @@ class _MonitorScreenState extends State<MonitorScreen>
       (timestamp) => now.difference(timestamp) > const Duration(seconds: 1),
     );
     _framesPerSecond = _recentFrameTimes.length.toDouble();
-    if (_busIsSilent &&
-        _lastFrameAt != null &&
-        now.difference(_lastFrameAt!) < _frameTimeoutDuration) {
-      setState(() => _busIsSilent = false);
-    }
 
     setState(() {
       for (final frame in batch) {
@@ -465,6 +475,9 @@ class _MonitorScreenState extends State<MonitorScreen>
       reconnectCount: _reconnectCount,
       busIsSilent: _busIsSilent,
       transport: _serial != null ? 'usbSerial' : 'ble',
+      rxOverflowActive: _isHardware
+          ? _telemetryDiagnostics.snapshot.rxOverflowActive
+          : null,
     );
     _recordNewHealthFindings(report);
     if (mounted &&
@@ -483,6 +496,17 @@ class _MonitorScreenState extends State<MonitorScreen>
         .toSet();
     for (final finding in report.findings) {
       if (previousTitles.contains(finding.title)) continue;
+      if (_isHardware &&
+          const {
+            'Silent CAN bus',
+            'Bus-off',
+            'Bus recovery in progress',
+            'Error passive',
+            'Error warning',
+            'RX overflow',
+          }.contains(finding.title)) {
+        continue; // Recorded by the shared diagnostics lifecycle.
+      }
 
       _sessionService.recordSessionEvent(
         CanSessionEvent.create(
@@ -514,6 +538,7 @@ class _MonitorScreenState extends State<MonitorScreen>
     final previousTitles = _anomalies.map((anomaly) => anomaly.title).toSet();
     for (final anomaly in anomalies) {
       if (previousTitles.contains(anomaly.title)) continue;
+      if (_isHardware && anomaly.type == CanAnomalyType.silentPeriod) continue;
       _sessionService.recordSessionEvent(
         CanSessionEvent.create(
           type: CanSessionEventType.diagnostic,
@@ -550,7 +575,7 @@ class _MonitorScreenState extends State<MonitorScreen>
       case CanAnomalyType.repeatedError:
       case CanAnomalyType.burstTraffic:
       case CanAnomalyType.unstableRecovery:
-        return DiagnosticCause.busNoise;
+        return DiagnosticCause.unknown;
     }
   }
 
@@ -578,7 +603,7 @@ class _MonitorScreenState extends State<MonitorScreen>
       case 'Error passive':
       case 'Error warning':
       case 'High frame error rate':
-        return DiagnosticCause.busNoise;
+        return DiagnosticCause.unknown;
       case 'RX overflow':
         return DiagnosticCause.rxOverflow;
       case 'Reconnect storm':
@@ -604,9 +629,15 @@ class _MonitorScreenState extends State<MonitorScreen>
       _errorFrames = 0;
       _errorStats.updateAll((key, value) => 0);
       _telemetryDiagnostics.reset();
-      _monitorStartedAt = DateTime.now();
+      if (_isHardware) {
+        _telemetryDiagnostics.updateSourceState(
+          _sourceState ?? SourceState.connecting,
+          sourceName: _source.name,
+        );
+      }
       _lastFrameAt = null;
       _latestStats = null;
+      _busIsSilent = false;
       setState(() {
         _isRunning = true;
       });
@@ -716,6 +747,9 @@ class _MonitorScreenState extends State<MonitorScreen>
       _totalFrames = 0;
       _errorFrames = 0;
       _isRunning = false;
+      _telemetryDiagnostics.reset();
+      _latestStats = null;
+      _busIsSilent = false;
 
       // Reset error statistics
       for (var type in CanErrorType.values) {
@@ -863,9 +897,7 @@ class _MonitorScreenState extends State<MonitorScreen>
         body: LayoutBuilder(
           builder: (context, constraints) => SingleChildScrollView(
             child: SizedBox(
-              height: _source.statsStream != null
-                  ? constraints.maxHeight.clamp(1080.0, double.infinity)
-                  : constraints.maxHeight,
+              height: _isHardware ? null : constraints.maxHeight,
               child: Column(
                 children: [
                   // BLE connection state banner (hidden for simulator)
@@ -873,21 +905,26 @@ class _MonitorScreenState extends State<MonitorScreen>
                   if (_serial != null) _buildSerialStatus(),
                   if (_source is BleCanSource) _buildBleRecordingStatus(),
 
-                  // Bus-off / error-passive / silent alert (BLE only)
-                  if (_latestStats != null || _busIsSilent)
-                    _buildBusOffBanner(),
-
-                  // TWAI hardware counters row (BLE only)
-                  if (_latestStats != null) _buildHardwareStatsPanel(),
-
                   // Statistics Panel
                   _buildStatisticsPanel(),
+
+                  if (_isHardware)
+                    CanBusDiagnosticsPanel(
+                      snapshot: _telemetryDiagnostics.snapshot,
+                      events: _telemetryDiagnostics.recentEvents,
+                    ),
 
                   // Frame List Header
                   _buildFrameListHeader(),
 
                   // Frame List
-                  Expanded(flex: 2, child: _buildFrameList()),
+                  if (_isHardware)
+                    SizedBox(
+                      height: constraints.maxHeight.clamp(320.0, 560.0),
+                      child: _buildFrameList(),
+                    )
+                  else
+                    Expanded(flex: 2, child: _buildFrameList()),
 
                   // Live Error Rate Chart
                   Container(
@@ -942,244 +979,6 @@ class _MonitorScreenState extends State<MonitorScreen>
       ),
     );
   }
-
-  Widget _buildBusOffBanner() {
-    final stats = _latestStats;
-
-    // Stats not arrived yet but bus already went silent (e.g., BLE connected, wire pulled immediately)
-    if (stats == null) {
-      if (!_busIsSilent) return const SizedBox.shrink();
-      return _alertBanner(
-        Icons.cable_outlined,
-        'CAN bus silent — no frames for 3 s. Wire disconnected or SENDER off?',
-        AppTheme.primaryOrange,
-        null,
-      );
-    }
-
-    // Priority order: BUS_OFF > RECOVERING > silent bus > error passive
-    final String? label;
-    final Color color;
-    final IconData icon;
-
-    if (stats.isBusOff) {
-      label =
-          'BUS-OFF — TX error limit reached (TEC > 255). Recovery in progress…';
-      color = AppTheme.accentRed;
-      icon = Icons.dangerous_outlined;
-    } else if (stats.isRecovering) {
-      label = 'Recovering from bus-off…';
-      color = AppTheme.primaryAmber;
-      icon = Icons.autorenew;
-    } else if (_busIsSilent) {
-      label =
-          'CAN bus silent — no frames for 3 s. Wire disconnected or SENDER off?';
-      color = AppTheme.primaryOrange;
-      icon = Icons.cable_outlined;
-    } else if (stats.isErrorPassive) {
-      // TEC or REC > 127: node entered error-passive per CAN spec (ISO 11898-1 §6.15)
-      label =
-          'Error Passive — TEC ${stats.txErrorCounter} / REC ${stats.rxErrorCounter} > 127. Approaching bus-off.';
-      color = AppTheme.primaryAmber;
-      icon = Icons.warning_amber_rounded;
-    } else if (stats.isErrorWarning) {
-      // TEC or REC 96–127: Error Warning level — still error-active but degraded
-      label =
-          'Error Warning — TEC ${stats.txErrorCounter} / REC ${stats.rxErrorCounter} > 96. Monitor bus quality.';
-      color = Colors.yellow.shade700;
-      icon = Icons.report_problem_outlined;
-    } else {
-      return const SizedBox.shrink();
-    }
-
-    return _alertBanner(icon, label, color, stats.isRunning ? stats : null);
-  }
-
-  Widget _alertBanner(
-    IconData icon,
-    String label,
-    Color color,
-    CanStats? counters,
-  ) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      color: color.withValues(alpha: 0.18),
-      child: Row(
-        children: [
-          Icon(icon, color: color, size: 18),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              label,
-              style: TextStyle(
-                color: color,
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
-          if (counters != null)
-            Text(
-              'TEC: ${counters.txErrorCounter}  REC: ${counters.rxErrorCounter}',
-              style: TextStyle(
-                color: color.withValues(alpha: 0.8),
-                fontSize: 11,
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  /// Compact TWAI hardware counters row — visible only for real BLE source.
-  Widget _buildHardwareStatsPanel() {
-    final stats = _latestStats;
-    if (stats == null) return const SizedBox.shrink();
-
-    final stateColor = stats.isBusOff
-        ? AppTheme.accentRed
-        : stats.isRecovering
-        ? AppTheme.primaryAmber
-        : AppTheme.accentGreen;
-
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      decoration: BoxDecoration(
-        color: AppTheme.darkSurface,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: stateColor.withValues(alpha: 0.3)),
-      ),
-      child: Wrap(
-        crossAxisAlignment: WrapCrossAlignment.center,
-        runSpacing: 8,
-        children: [
-          // Bus state chip
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-            decoration: BoxDecoration(
-              color: stateColor.withValues(alpha: 0.15),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(color: stateColor.withValues(alpha: 0.4)),
-            ),
-            child: Text(
-              stats.busState,
-              style: TextStyle(
-                color: stateColor,
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          _hwStat(
-            'TEC',
-            stats.txErrorCounter,
-            stats.txErrorCounter > 127
-                ? AppTheme.accentRed
-                : AppTheme.textSecondary,
-          ),
-          const SizedBox(width: 12),
-          _hwStat(
-            'REC',
-            stats.rxErrorCounter,
-            stats.rxErrorCounter > 127
-                ? AppTheme.accentRed
-                : AppTheme.textSecondary,
-          ),
-          const SizedBox(width: 12),
-          _hwStat('RX', stats.rxTotal, AppTheme.primaryAmber),
-          const SizedBox(width: 12),
-          _hwStat(
-            'MISS',
-            stats.rxMissed,
-            stats.rxMissed > 0 ? AppTheme.primaryOrange : AppTheme.textMuted,
-          ),
-          if (stats.isNoAckMode) ...[
-            const SizedBox(width: 10),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: AppTheme.accentRed.withValues(alpha: 0.15),
-                borderRadius: BorderRadius.circular(4),
-                border: Border.all(
-                  color: AppTheme.accentRed.withValues(alpha: 0.5),
-                ),
-              ),
-              child: const Text(
-                'NO-ACK',
-                style: TextStyle(
-                  color: AppTheme.accentRed,
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-          ],
-          if (stats.isSpeedMismatchDemo) ...[
-            const SizedBox(width: 10),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: AppTheme.primaryAmber.withValues(alpha: 0.15),
-                borderRadius: BorderRadius.circular(4),
-                border: Border.all(
-                  color: AppTheme.primaryAmber.withValues(alpha: 0.5),
-                ),
-              ),
-              child: const Text(
-                '250k≠500k',
-                style: TextStyle(
-                  color: AppTheme.primaryAmber,
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-          ],
-          const SizedBox(width: 16),
-          Text(
-            'TWAI ${_formatTime(stats.timestamp)}',
-            style: const TextStyle(color: AppTheme.textMuted, fontSize: 10),
-          ),
-          if (stats.reasonCode != null) ...[
-            const SizedBox(width: 8),
-            Text(
-              stats.reasonCode!,
-              style: const TextStyle(
-                color: AppTheme.textSecondary,
-                fontSize: 10,
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _hwStat(String label, int value, Color color) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          '$value',
-          style: TextStyle(
-            color: color,
-            fontSize: 13,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        Text(
-          label,
-          style: const TextStyle(color: AppTheme.textMuted, fontSize: 10),
-        ),
-      ],
-    );
-  }
-
-  String _formatTime(DateTime dt) =>
-      '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
 
   Widget _buildConnectionBanner() {
     final state = _sourceState;
@@ -1413,7 +1212,9 @@ class _MonitorScreenState extends State<MonitorScreen>
               const SizedBox(width: 8),
               _buildStatCard(
                     'Health',
-                    '${_healthReport.score}/100',
+                    _isHardware && _latestStats == null
+                        ? 'N/A'
+                        : '${_healthReport.score}/100',
                     Icons.health_and_safety,
                     _healthColor(_healthReport.severity),
                   )
@@ -1468,7 +1269,7 @@ class _MonitorScreenState extends State<MonitorScreen>
     IconData icon,
     Color color,
   ) {
-    return Container(
+    return SizedBox(
       width: 85, // Fixed width to prevent overflow
       child: AnimatedCard(
         padding: const EdgeInsets.all(8),
@@ -2327,15 +2128,17 @@ class _MonitorScreenState extends State<MonitorScreen>
               ),
             ),
             const SizedBox(width: 12),
-            const Text(
-              'Live Error Rate (%)',
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: AppTheme.textPrimary,
-                fontSize: 14,
+            const Expanded(
+              child: Text(
+                'Live Error Rate (%)',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: AppTheme.textPrimary,
+                  fontSize: 14,
+                ),
               ),
             ),
-            const Spacer(),
+            const SizedBox(width: 8),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
